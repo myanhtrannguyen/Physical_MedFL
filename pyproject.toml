@@ -1,0 +1,51 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "flower-federated-learning-physical-medical-segmentation"
+version = "0.1.0"
+authors = [
+  { name="Your Name", email="you@example.com" },
+]
+description = "A Flower federated learning example with RobustMedVFL_UNet."
+readme = "README.md"
+requires-python = ">=3.8"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: Apache Software License", 
+    "Operating System :: OS Independent",
+]
+dependencies = [
+    "flwr[simulation]==1.8.0", # Using 1.8.0 as per your request, simulation extra for potential local testing
+    "torch",
+    "torchvision",  # Added dependency for transforms and other utilities
+    "scikit-image",
+    "scikit-learn",
+    "numpy",
+    "h5py"  # Required by model_and_data_handle.py
+]
+
+[tool.hatch.build.targets.wheel]
+# Include all .py files from the project root in the wheel.
+# This tells Hatch where to find your application code.
+packages = ["."] 
+
+[tool.flwr.app]
+# This section tells Flower CLI how to load your app
+# For a single SuperNode that runs both client and server logic (simulation):
+# components.clientapp = "app_client:app"
+# components.serverapp = "app_server:app"
+
+# If you run client and server separately:
+# Client component (when running `flower-client --app ...`)
+# client = "app_client:app"
+
+# Server component (when running `flower-server --app ...`)
+# server = "app_server:app"
+
+# For running with `flower-simulation` (which is often easier for development)
+# you define the clientapp and serverapp that the simulation engine will use.
+[tool.flwr.app.components]
+clientapp = "app_client:app"
+serverapp = "app_server:app"

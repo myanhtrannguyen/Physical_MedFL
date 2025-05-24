@@ -1,0 +1,48 @@
+# filepath: /Users/alvinluong/Documents/Federated_Learning/.gitignore
+# Ignore virtual environments
+.venv_py310/
+.venv_py310/**
+.venv*/
+venv/
+env/
+.venv_*/
+**/site-packages/**/*.dylib
+**/site-packages/**/*.so
+**/site-packages/**/*.dll
+
+# Python cache files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+
+# PyTorch model files
+*.pt
+*.pth
+*.ckpt
+
+# Data directories
+data/
+datasets/
+ACDC/
+ACDC_preprocessed/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# IDE files
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Logs and temporary files
+logs/
+*.log
+tmp/
+temp/
