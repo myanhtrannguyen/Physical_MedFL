@@ -49,9 +49,9 @@ def create_model(
 def create_unet_model(config: Dict[str, Any]) -> nn.Module:
     """Create U-Net model."""
     try:
-        from .mlp_model import RobustMedVFL_UNet
+        from .mlp_model import OptimizedRobustMedVFL_UNet
         
-        model = RobustMedVFL_UNet(
+        model = OptimizedRobustMedVFL_UNet(
             n_channels=config.get('n_channels', 1),
             n_classes=config.get('n_classes', 4),
             dropout_rate=config.get('dropout_rate', 0.1)
