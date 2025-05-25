@@ -345,23 +345,23 @@ def create_dataset_from_paths(
         images = []
         masks = []
         
-                          for i, img_path in enumerate(image_paths):
-             # Load and preprocess image
-             if img_path.endswith('.nii') or img_path.endswith('.nii.gz'):
-                 nii_img = nib.load(img_path)  # type: ignore
-                 image = np.array(nii_img.get_fdata()).astype(np.float32)  # type: ignore
-             else:
-                 continue
-             
-             image = preprocessor.preprocess_image(image)
-             images.append(image)
-             
-             # Load mask if available
-             if mask_paths and i < len(mask_paths) and mask_paths[i]:
-                 nii_mask = nib.load(mask_paths[i])  # type: ignore
-                 mask = np.array(nii_mask.get_fdata()).astype(np.int64)  # type: ignore
-                 mask = preprocessor.preprocess_mask(mask)
-                 masks.append(mask)
+        for i, img_path in enumerate(image_paths):
+            # Load and preprocess image
+            if img_path.endswith('.nii') or img_path.endswith('.nii.gz'):
+                nii_img = nib.load(img_path)  # type: ignore
+                image = np.array(nii_img.get_fdata()).astype(np.float32)  # type: ignore
+            else:
+                continue
+            
+            image = preprocessor.preprocess_image(image)
+            images.append(image)
+            
+            # Load mask if available
+            if mask_paths and i < len(mask_paths) and mask_paths[i]:
+                nii_mask = nib.load(mask_paths[i])  # type: ignore
+                mask = np.array(nii_mask.get_fdata()).astype(np.int64)  # type: ignore
+                mask = preprocessor.preprocess_mask(mask)
+                masks.append(mask)
         
         images = np.array(images)
         masks = np.array(masks) if masks else None

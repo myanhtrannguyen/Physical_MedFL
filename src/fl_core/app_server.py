@@ -1,475 +1,1213 @@
+"""
+Enhanced Federated Learning Server for Medical Image Segmentation
+Comprehensive implementation with adaptive strategies and medical domain specialization
+"""
+
+# =============================================================================
+# 1. HEADER AND IMPORTS SECTION
+# =============================================================================
+
+# 1.1 Standard Library Imports
+import os
+import sys
+import logging
+import warnings
+import time
+import json
+import pickle
+import math
+from typing import Dict, List, Tuple, Optional, Any, Callable
+from collections import OrderedDict
+from pathlib import Path
+
+# 1.2 Scientific Computing Imports
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, Dataset
+import torch.nn.functional as F
+
+# 1.3 Flower Framework Imports
 import flwr as fl
-from typing import Dict, Optional, Tuple, List
+from flwr.server import ServerApp, ServerConfig
+try:
+    from flwr.server import ServerAppComponents
+except ImportError:
+    # Fallback for older Flower versions
+    from typing import NamedTuple
+    class ServerAppComponents(NamedTuple):
+        strategy: Strategy
+        config: ServerConfig
+from flwr.server.strategy import Strategy
+from flwr.common import Context, Parameters, FitRes, EvaluateRes, Scalar
+from flwr.common import FitIns, EvaluateIns, GetParametersIns
 from flwr.server.client_proxy import ClientProxy
-from flwr.common import FitRes, Parameters, Scalar, FitIns, EvaluateIns
 
-# You might not need direct model access on the server if you're just aggregating.
-# However, if your strategy needs to evaluate a global model, you might.
-# For FedAvg, it's usually not needed on the server side directly for the strategy itself.
-# from model_and_data_handle import RobustMedVFL_UNet, load_h5_data, evaluate_metrics, DEVICE, NUM_CLASSES
+# 1.4 Project-Specific Imports
+# Updated imports to use the refactored structure
+from ..models.mlp_model import (
+    OptimizedRobustMedVFL_UNet, 
+    OptimizedCombinedLoss, 
+    optimized_quantum_noise_injection
+)
+from ..data.dataset import ACDCDataset
+from ..data.loader import create_acdc_dataloader, create_dataloader
+from ..utils.seed import set_seed
+from ..utils.logger import setup_federated_logger
+from ..utils.metrics import evaluate_metrics, compute_class_weights, print_metrics_summary
 
-# Define a comprehensive FedAvg strategy
-class FedAvgStrategy(fl.server.strategy.FedAvg):
+# =============================================================================
+# 2. GLOBAL CONFIGURATION AND CONSTANTS
+# =============================================================================
+
+# 2.1 Server Configuration Constants  
+class ServerConstants:
+    """Centralized server configuration management"""
+    
+    # Default hyperparameters
+    DEFAULT_LEARNING_RATE = 1e-4
+    DEFAULT_BETA1 = 0.9
+    DEFAULT_BETA2 = 0.999
+    DEFAULT_EPSILON = 1e-8
+    DEFAULT_WEIGHT_DECAY = 1e-5
+    
+    # Aggregation parameters
+    DEFAULT_FRACTION_FIT = 1.0
+    DEFAULT_FRACTION_EVALUATE = 1.0
+    MIN_FIT_CLIENTS = 1
+    MIN_EVALUATE_CLIENTS = 1
+    MIN_AVAILABLE_CLIENTS = 1
+    MAX_CLIENTS_PER_ROUND = 10
+    
+    # Training constants
+    DEFAULT_ROUNDS = 10
+    DEFAULT_LOCAL_EPOCHS = 5
+    DEFAULT_BATCH_SIZE = 8
+    
+    # Medical imaging constants
+    NUM_CLASSES = 4
+    IMG_SIZE = 256
+    CLASS_NAMES = ['Background', 'RV', 'Myocardium', 'LV']
+    
+    # Resource limits
+    MAX_MEMORY_GB = 16
+    COMPUTATION_TIMEOUT = 600  # 10 minutes
+    MAX_MESSAGE_LENGTH = 512 * 1024 * 1024  # 512MB
+
+# 2.2 Environment Setup
+def setup_server_environment():
+    """Setup server environment with optimal configurations"""
+    # Device detection with fallback strategies
+    if torch.cuda.is_available():
+        device = torch.device('cuda')
+        print(f"✓ CUDA available: {torch.cuda.get_device_name()}")
+        print(f"✓ GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
+    else:
+        device = torch.device('cpu')
+        print("⚠ Using CPU - consider GPU for better performance")
+    
+    # Memory optimization
+    if device.type == 'cuda':
+        torch.cuda.empty_cache()
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cudnn.deterministic = False  # For performance
+    
+    # Random seed management
+    set_seed(42)
+    
+    return device
+
+# Global device setup
+DEVICE = setup_server_environment()
+
+# =============================================================================
+# 3. MEDICAL FEDADAM STRATEGY CLASS
+# =============================================================================
+
+class MedicalFedAdam(Strategy):
+    """
+    Advanced Federated Adam strategy specialized for medical image segmentation
+    Implements adaptive model complexity, medical domain constraints, and robust aggregation
+    """
+    
     def __init__(
         self,
-        min_fit_clients=2,
-        min_evaluate_clients=2,
-        min_available_clients=2,
-        evaluate_fn=None,
-        fraction_fit=1.0,
-        fraction_evaluate=1.0,
-        timeout_fit=300,  # 5 minutes
-        timeout_evaluate=300,  # 5 minutes
-        num_rounds=5  # Total number of training rounds
+        # 3.1.1 Core Parameters
+        learning_rate: float = ServerConstants.DEFAULT_LEARNING_RATE,
+        beta1: float = ServerConstants.DEFAULT_BETA1,
+        beta2: float = ServerConstants.DEFAULT_BETA2,
+        epsilon: float = ServerConstants.DEFAULT_EPSILON,
+        weight_decay: float = ServerConstants.DEFAULT_WEIGHT_DECAY,
+        
+        # Client selection parameters
+        fraction_fit: float = ServerConstants.DEFAULT_FRACTION_FIT,
+        fraction_evaluate: float = ServerConstants.DEFAULT_FRACTION_EVALUATE,
+        min_fit_clients: int = ServerConstants.MIN_FIT_CLIENTS,
+        min_evaluate_clients: int = ServerConstants.MIN_EVALUATE_CLIENTS,
+        min_available_clients: int = ServerConstants.MIN_AVAILABLE_CLIENTS,
+        max_clients_per_round: int = ServerConstants.MAX_CLIENTS_PER_ROUND,
+        
+        # Medical-specific parameters
+        noise_adaptation: bool = True,
+        physics_scheduling: bool = True,
+        progressive_complexity: bool = True,
+        
+        # Evaluation function
+        evaluate_fn: Optional[Callable] = None,
+        
+        # Additional parameters
+        num_rounds: int = ServerConstants.DEFAULT_ROUNDS,
     ):
-        # Define comprehensive fit_metrics_aggregation_fn
-        def fit_metrics_aggregation_fn(metrics_list):
-            """Aggregate fit metrics from multiple clients with weighted averaging."""
-            if len(metrics_list) == 0:
-                return {}
-            
-            # Handle different metric formats
-            processed_metrics = []
-            for metric in metrics_list:
-                if isinstance(metric, tuple) and len(metric) >= 2:
-                    # Format: (num_examples, metrics_dict)
-                    num_examples, metrics_dict = metric[0], metric[1]
-                    if isinstance(metrics_dict, dict):
-                        processed_metrics.append((num_examples, metrics_dict))
-                elif isinstance(metric, dict):
-                    # Direct metrics dict
-                    processed_metrics.append((1, metric))  # Default weight of 1
-            
-            if not processed_metrics:
-                return {}
-            
-            # Collect all unique metric keys
-            all_keys = set()
-            for _, metrics_dict in processed_metrics:
-                if isinstance(metrics_dict, dict):
-                    all_keys.update(metrics_dict.keys())
-            
-            # Weighted aggregation
-            aggregated = {}
-            total_examples = sum(num_examples for num_examples, _ in processed_metrics)
-            
-            for key in all_keys:
-                weighted_sum = 0.0
-                valid_entries = 0
-                
-                for num_examples, metrics_dict in processed_metrics:
-                    if key in metrics_dict:
-                        try:
-                            value = float(metrics_dict[key])
-                            weighted_sum += value * num_examples
-                            valid_entries += num_examples
-                        except (ValueError, TypeError):
-                            # Skip non-numeric values
-                            continue
-                
-                if valid_entries > 0:
-                    aggregated[key] = weighted_sum / valid_entries
-            
-            return aggregated
-            
-        super().__init__(
-            min_fit_clients=min_fit_clients,
-            min_evaluate_clients=min_evaluate_clients,
-            min_available_clients=min_available_clients,
-            fit_metrics_aggregation_fn=fit_metrics_aggregation_fn,
-            evaluate_metrics_aggregation_fn=evaluate_metrics_aggregation_fn,
-            evaluate_fn=evaluate_fn,
-            fraction_fit=fraction_fit,
-            fraction_evaluate=fraction_evaluate,
-        )
-        self.timeout_fit = timeout_fit
-        self.timeout_evaluate = timeout_evaluate
+        """Initialize MedicalFedAdam strategy with comprehensive configuration"""
+        
+        # 3.1.2 Adam State Management
+        self.learning_rate = learning_rate
+        self.beta1 = beta1
+        self.beta2 = beta2
+        self.epsilon = epsilon
+        self.weight_decay = weight_decay
+        
+        # Moment estimates (initialized when first parameters received)
+        self.m: Optional[List[torch.Tensor]] = None  # First moment
+        self.v: Optional[List[torch.Tensor]] = None  # Second moment
+        self.t = 0  # Time step for bias correction
+        
+        # Global model state
+        self.current_global_params: Optional[Parameters] = None
+        self.convergence_history = []
+        self.loss_history = []
+        
+        # Client selection parameters
+        self.fraction_fit = fraction_fit
+        self.fraction_evaluate = fraction_evaluate
+        self.min_fit_clients = min_fit_clients
+        self.min_evaluate_clients = min_evaluate_clients
+        self.min_available_clients = min_available_clients
+        self.max_clients_per_round = max_clients_per_round
+        
+        # 3.1.3 Medical Domain Configuration
+        self.noise_adaptation = noise_adaptation
+        self.physics_scheduling = physics_scheduling
+        self.progressive_complexity = progressive_complexity
         self.num_rounds = num_rounds
         
-        # Performance tracking for adaptive learning
+        # Evaluation function
+        self.evaluate_fn = evaluate_fn
+        
+        # Performance tracking
         self.round_metrics = {}
         self.best_global_metric = 0.0
         self.rounds_without_improvement = 0
-        self.max_patience = 3  # Stop if no improvement for 3 rounds
+        self.max_patience = 3
         
-        print(f"Enhanced FedAvgStrategy initialized for {num_rounds} rounds")
-        print(f"✓ Adaptive learning rate and early stopping enabled")
-        print(f"✓ Performance tracking for global model improvement")
-
+        # Client quality tracking
+        self.client_quality_scores = {}
+        self.client_reliability_scores = {}
+        
+        # Setup logging
+        self.logger = setup_federated_logger(client_id=None, log_dir="logs/server")
+        self.logger.info("MedicalFedAdam strategy initialized")
+        self.logger.info(f"Configuration: lr={learning_rate}, rounds={num_rounds}")
+        
+    def _get_pruning_config(self, server_round: int) -> Dict[str, Any]:
+        """
+        Get adaptive pruning configuration based on round number
+        Implements progressive complexity scheduling
+        """
+        if not self.progressive_complexity:
+            # Use balanced configuration throughout
+            return {
+                'noise_processing_levels': [0, 1],
+                'maxwell_solver_levels': [0, 1],
+                'dropout_positions': [0],
+                'skip_quantum_noise': False
+            }
+        
+        # Progressive complexity scheduling
+        if server_round <= 5:
+            # Early rounds: Simplified model
+            config = {
+                'noise_processing_levels': [0],  # Only first level
+                'maxwell_solver_levels': [],     # No physics initially
+                'dropout_positions': [0],
+                'skip_quantum_noise': True       # No quantum noise initially
+            }
+            self.logger.info(f"Round {server_round}: Using simplified model configuration")
+            
+        elif server_round <= 15:
+            # Middle rounds: Progressive complexity
+            config = {
+                'noise_processing_levels': [0, 1],
+                'maxwell_solver_levels': [0],    # Limited physics
+                'dropout_positions': [0],
+                'skip_quantum_noise': False
+            }
+            self.logger.info(f"Round {server_round}: Using moderate complexity configuration")
+            
+        else:
+            # Later rounds: Full complexity
+            config = {
+                'noise_processing_levels': [0, 1, 2],
+                'maxwell_solver_levels': [0, 1],
+                'dropout_positions': [0],
+                'skip_quantum_noise': False
+            }
+            self.logger.info(f"Round {server_round}: Using full complexity configuration")
+            
+        return config
+    
+    def _get_noise_schedule(self, server_round: int) -> Dict[str, float]:
+        """Get adaptive noise scheduling parameters"""
+        if not self.noise_adaptation:
+            return {
+                'quantum_noise_factor': 0.05,
+                'dropout_rate': 0.1,
+                'augmentation_intensity': 0.5
+            }
+        
+        # Progressive noise scheduling
+        progress = min(server_round / self.num_rounds, 1.0)
+        
+        # Quantum noise: Start low, increase gradually
+        quantum_noise_factor = 0.02 + 0.03 * progress
+        
+        # Dropout: Adaptive based on convergence
+        if len(self.loss_history) > 2:
+            recent_improvement = self.loss_history[-2] - self.loss_history[-1]
+            if recent_improvement < 0.01:  # Poor improvement
+                dropout_rate = min(0.2, 0.1 + 0.05 * (1 - recent_improvement))
+            else:
+                dropout_rate = 0.1
+        else:
+            dropout_rate = 0.1
+        
+        # Augmentation: Medical-safe progression
+        augmentation_intensity = 0.3 + 0.2 * progress
+        
+        return {
+            'quantum_noise_factor': quantum_noise_factor,
+            'dropout_rate': dropout_rate,
+            'augmentation_intensity': augmentation_intensity
+        }
+    
+    def _get_learning_rate_schedule(self, server_round: int) -> float:
+        """Get adaptive learning rate based on round and convergence"""
+        base_lr = self.learning_rate
+        
+        # Exponential decay with step scheduling
+        if server_round <= 5:
+            lr_multiplier = 1.0
+        elif server_round <= 10:
+            lr_multiplier = 0.5
+        elif server_round <= 15:
+            lr_multiplier = 0.2
+        else:
+            lr_multiplier = 0.1
+        
+        # Adaptive adjustment based on convergence
+        if len(self.loss_history) > 3:
+            recent_losses = self.loss_history[-3:]
+            if all(recent_losses[i] <= recent_losses[i+1] for i in range(len(recent_losses)-1)):
+                # Loss is increasing - reduce learning rate
+                lr_multiplier *= 0.5
+                self.logger.warning(f"Loss increasing - reducing learning rate to {base_lr * lr_multiplier}")
+        
+        return base_lr * lr_multiplier
+    
+    # 3.2 Client Configuration Methods
     def configure_fit(
-        self,
-        server_round: int,
-        parameters: Parameters,
-        client_manager: fl.server.client_manager.ClientManager,
+        self, 
+        server_round: int, 
+        parameters: Parameters, 
+        client_manager: fl.server.client_manager.ClientManager
     ) -> List[Tuple[ClientProxy, FitIns]]:
-        print(f"\n{'='*60}")
-        print(f"ROUND {server_round} - CONFIGURE FIT")
-        print(f"{'='*60}")
+        """
+        Configure clients for training with adaptive parameters
+        Implements round-based adaptation and medical domain optimization
+        """
+        self.logger.info(f"{'='*60}")
+        self.logger.info(f"ROUND {server_round} - CONFIGURE FIT")
+        self.logger.info(f"{'='*60}")
         
-        # Improved epoch scheduling for better convergence
-        if server_round <= 2:
-            epochs = 6  # More epochs early on for better learning
-        elif server_round <= 5:
-            epochs = 5  # Moderate epochs in middle rounds
+        # Get adaptive configurations
+        pruning_config = self._get_pruning_config(server_round)
+        noise_schedule = self._get_noise_schedule(server_round)
+        learning_rate = self._get_learning_rate_schedule(server_round)
+        
+        # Adaptive epoch scheduling
+        if server_round <= 3:
+            local_epochs = 6  # More epochs early for better learning
+        elif server_round <= 8:
+            local_epochs = 5  # Moderate epochs
         else:
-            epochs = 4  # Reduce in later rounds for fine-tuning
+            local_epochs = 4  # Fewer epochs for fine-tuning
         
-        # Optimized learning rate for full dataset training
-        if server_round == 1:
-            learning_rate = 5e-4  # Lower start with full data
-        elif server_round <= 3:
-            learning_rate = 2e-4  # Medium rate for stable progress  
-        elif server_round <= 5:
-            learning_rate = 1e-4  # Lower for fine-tuning
-        else:
-            learning_rate = 5e-5  # Very low for final convergence
-        
+        # Create comprehensive configuration
         config: Dict[str, Scalar] = {
+            # Training parameters
             "server_round": server_round,
-            "epochs": epochs,
+            "local_epochs": local_epochs,
             "learning_rate": learning_rate,
-            "weight_decay": 1e-4,  # Stronger regularization
-            "dropout_rate": 0.15,  # Moderate dropout for better generalization
-            "total_rounds": self.num_rounds
+            "weight_decay": self.weight_decay,
+                         "batch_size": ServerConstants.DEFAULT_BATCH_SIZE,
+             
+             # Model parameters
+             "dropout_rate": noise_schedule['dropout_rate'],
+             "quantum_noise_factor": noise_schedule['quantum_noise_factor'],
+             
+             # Pruning configuration (serialized as JSON)
+             "pruning_config": json.dumps(pruning_config),
+             
+             # Medical parameters
+             "augmentation_intensity": noise_schedule['augmentation_intensity'],
+             "num_classes": ServerConstants.NUM_CLASSES,
+            
+            # Round metadata
+            "total_rounds": self.num_rounds,
+            "convergence_status": "improving" if self.rounds_without_improvement < 2 else "stable",
+            
+            # Physics scheduling
+            "enable_physics": self.physics_scheduling and server_round > 5,
         }
         
-        print(f"Training configuration:")
-        print(f"  Epochs: {epochs}")
-        print(f"  Learning rate: {learning_rate}")
-        print(f"  Weight decay: {config['weight_decay']}")
-        print(f"  Dropout rate: {config['dropout_rate']}")
-        print(f"  Round: {server_round}/{self.num_rounds}")
+        # Log configuration
+        self.logger.info(f"Training configuration for round {server_round}:")
+        self.logger.info(f"  Local epochs: {local_epochs}")
+        self.logger.info(f"  Learning rate: {learning_rate:.2e}")
+        self.logger.info(f"  Dropout rate: {noise_schedule['dropout_rate']:.3f}")
+        self.logger.info(f"  Quantum noise: {noise_schedule['quantum_noise_factor']:.3f}")
+        self.logger.info(f"  Physics enabled: {config['enable_physics']}")
         
+                 # Client selection with quality awareness
+         available_clients_dict = client_manager.all()
+         available_clients = list(available_clients_dict.values()) if isinstance(available_clients_dict, dict) else available_clients_dict
+         
+         # Resource-aware and quality-based selection
+         selected_clients = self._select_clients_intelligently(
+             available_clients, 
+             server_round,
+             min(self.max_clients_per_round, len(available_clients))
+         )
+        
+        self.logger.info(f"  Selected {len(selected_clients)} clients for training")
+        
+        # Create FitIns for each client
         fit_ins = FitIns(parameters, config)
-
-        # Sample clients
-        clients = client_manager.sample(
-            num_clients=self.min_fit_clients, min_num_clients=self.min_fit_clients
-        )
-        print(f"  Selected {len(clients)} clients for training")
-        return [(client, fit_ins) for client in clients]
-
+        return [(client, fit_ins) for client in selected_clients]
+    
     def configure_evaluate(
         self,
         server_round: int,
         parameters: Parameters,
         client_manager: fl.server.client_manager.ClientManager,
     ) -> List[Tuple[ClientProxy, EvaluateIns]]:
-        print(f"\nCONFIGURE EVALUATION - Round {server_round}")
+        """Configure clients for evaluation with medical-specific metrics"""
+        self.logger.info(f"CONFIGURE EVALUATION - Round {server_round}")
+        
+        # Evaluation configuration
         config: Dict[str, Scalar] = {
             "server_round": server_round,
-            "total_rounds": self.num_rounds
+            "total_rounds": self.num_rounds,
+            "evaluation_depth": "comprehensive" if server_round % 5 == 0 else "standard",
+            "num_classes": ServerConfig.NUM_CLASSES,
+            "collect_medical_metrics": True,
+            "collect_physics_metrics": self.physics_scheduling,
         }
-        eval_ins = EvaluateIns(parameters, config)
-
-        # Sample clients
-        clients = client_manager.sample(
-            num_clients=self.min_evaluate_clients, min_num_clients=self.min_evaluate_clients
+        
+        # Select clients for evaluation
+        available_clients = client_manager.all()
+        num_eval_clients = min(
+            max(self.min_evaluate_clients, len(available_clients) // 2),
+            len(available_clients)
         )
-        print(f"  Selected {len(clients)} clients for evaluation")
-        return [(client, eval_ins) for client in clients]
-
+        
+        selected_clients = client_manager.sample(
+            num_clients=num_eval_clients,
+            min_num_clients=self.min_evaluate_clients
+        )
+        
+        self.logger.info(f"  Selected {len(selected_clients)} clients for evaluation")
+        
+        eval_ins = EvaluateIns(parameters, config)
+        return [(client, eval_ins) for client in selected_clients]
+    
+    def _select_clients_intelligently(
+        self, 
+        available_clients: List[ClientProxy], 
+        server_round: int,
+        num_clients: int
+    ) -> List[ClientProxy]:
+        """
+        Intelligent client selection based on quality, reliability, and diversity
+        """
+        if len(available_clients) <= num_clients:
+            return available_clients
+        
+        # Simple selection for early rounds when we don't have history
+        if server_round <= 2 or not self.client_quality_scores:
+            return available_clients[:num_clients]
+        
+        # Score-based selection for later rounds
+        client_scores = []
+        for client in available_clients:
+            cid = client.cid
+            
+            # Base score
+            quality_score = self.client_quality_scores.get(cid, 0.5)
+            reliability_score = self.client_reliability_scores.get(cid, 0.5)
+            
+            # Combined score with weights
+            combined_score = 0.6 * quality_score + 0.4 * reliability_score
+            
+            client_scores.append((client, combined_score))
+        
+        # Sort by score and select top clients
+        client_scores.sort(key=lambda x: x[1], reverse=True)
+        selected_clients = [client for client, _ in client_scores[:num_clients]]
+        
+        self.logger.info(f"  Client selection based on quality scores")
+        return selected_clients
+    
+    # 3.3 Aggregation Methods
     def aggregate_fit(
         self,
         server_round: int,
         results: List[Tuple[ClientProxy, FitRes]],
         failures: List[Tuple[ClientProxy, FitRes] | BaseException],
     ) -> Tuple[Optional[Parameters], Dict[str, Scalar]]:
-        print(f"\nAGGREGATE FIT RESULTS - Round {server_round}")
+        """
+        Advanced parameter aggregation using FedAdam with medical domain adaptations
+        """
+        self.logger.info(f"AGGREGATE FIT RESULTS - Round {server_round}")
         
-        # Log failures
+        # 3.3.1 Pre-aggregation validation
         if failures:
-            print(f"⚠ Training failures: {len(failures)}")
+            self.logger.warning(f"Training failures: {len(failures)}")
             for i, failure in enumerate(failures):
-                print(f"  Failure {i+1}: {type(failure).__name__}")
+                self.logger.warning(f"  Failure {i+1}: {type(failure).__name__}")
         
         if not results:
-            print("❌ No successful training results to aggregate!")
+            self.logger.error("No successful training results to aggregate!")
             return None, {}
         
-        print(f"✓ Successfully received results from {len(results)} clients")
+        self.logger.info(f"Successfully received results from {len(results)} clients")
         
-        # Aggregate parameters and metrics
-        aggregated_parameters, aggregated_metrics = super().aggregate_fit(server_round, results, failures)
+        # Extract parameters and weights
+        parameters_list = []
+        weights_list = []
+        client_metrics = {}
         
-        # Detailed logging of aggregated metrics with performance tracking
-        if aggregated_metrics:
-            print(f"📊 Aggregated training metrics:")
-            for key, value in aggregated_metrics.items():
-                if isinstance(value, (int, float)):
-                    print(f"  {key}: {value:.4f}")
-                else:
-                    print(f"  {key}: {value}")
+        for client_proxy, fit_res in results:
+            cid = client_proxy.cid
+            parameters_list.append(fit_res.parameters)
+            weights_list.append(fit_res.num_examples)
+            client_metrics[cid] = fit_res.metrics
             
-            # Store metrics for trend analysis
-            self.round_metrics[f"round_{server_round}_train"] = aggregated_metrics
-            
-            # Check for training stability (high loss growth indicates problems)
-            if "train_loss" in aggregated_metrics:
-                if server_round > 1:
-                    prev_loss = self.round_metrics.get(f"round_{server_round-1}_train", {}).get("train_loss", 0)
-                    current_loss = aggregated_metrics["train_loss"]
-                    loss_change = current_loss - prev_loss
-                    
-                    if loss_change > 0.5:  # Significant loss increase
-                        print(f"⚠️  WARNING: Training loss increased significantly (+{loss_change:.3f})")
-                        print(f"   Consider reducing learning rate for next round")
-                    elif loss_change < -0.1:  # Good loss decrease
-                        print(f"✅ Training loss improved by {-loss_change:.3f}")
+            # Update client quality scores based on training metrics
+            if fit_res.metrics and 'train_loss' in fit_res.metrics:
+                train_loss = fit_res.metrics['train_loss']
+                # Quality score based on loss (lower loss = higher quality)
+                quality_score = max(0.1, min(1.0, 1.0 / (1.0 + train_loss)))
+                self.client_quality_scores[cid] = quality_score
+                
+                # Update reliability (successful completion)
+                current_reliability = self.client_reliability_scores.get(cid, 0.5)
+                self.client_reliability_scores[cid] = 0.9 * current_reliability + 0.1 * 1.0
         
-        return aggregated_parameters, aggregated_metrics
-
+        # Convert parameters to tensors
+        def parameters_to_tensors(parameters: Parameters) -> List[torch.Tensor]:
+            return [torch.tensor(np.array(param)) for param in parameters.tensors]
+        
+        # Get current global parameters as tensors
+        if self.current_global_params is None:
+            # First round - use first client's parameters as baseline
+            global_tensors = parameters_to_tensors(parameters_list[0])
+        else:
+            global_tensors = parameters_to_tensors(self.current_global_params)
+        
+        # 3.3.2 Pseudo-gradient computation with weighted averaging
+        total_examples = sum(weights_list)
+        pseudo_gradients = []
+        
+        for i, param_tensor in enumerate(global_tensors):
+            weighted_diff = torch.zeros_like(param_tensor, dtype=torch.float32)
+            
+            for j, (parameters, weight) in enumerate(zip(parameters_list, weights_list)):
+                client_tensors = parameters_to_tensors(parameters)
+                if i < len(client_tensors):
+                    # Compute pseudo-gradient: global_param - client_param
+                    diff = param_tensor.float() - client_tensors[i].float()
+                    weighted_diff += (weight / total_examples) * diff
+            
+            pseudo_gradients.append(weighted_diff)
+        
+        # 3.3.3 Adam optimization step
+        self.t += 1  # Increment time step
+        
+        # Initialize moment estimates if first round
+        if self.m is None:
+            self.m = [torch.zeros_like(grad) for grad in pseudo_gradients]
+            self.v = [torch.zeros_like(grad) for grad in pseudo_gradients]
+        
+        # Update moment estimates and apply Adam step
+        updated_params = []
+        for i, (param, grad) in enumerate(zip(global_tensors, pseudo_gradients)):
+            # Update biased first moment estimate
+            self.m[i] = self.beta1 * self.m[i] + (1 - self.beta1) * grad
+            
+            # Update biased second raw moment estimate
+            self.v[i] = self.beta2 * self.v[i] + (1 - self.beta2) * (grad ** 2)
+            
+            # Compute bias-corrected first moment estimate
+            m_hat = self.m[i] / (1 - self.beta1 ** self.t)
+            
+            # Compute bias-corrected second raw moment estimate
+            v_hat = self.v[i] / (1 - self.beta2 ** self.t)
+            
+            # Apply Adam update with weight decay
+            param_float = param.float()
+            update = self.learning_rate * m_hat / (torch.sqrt(v_hat) + self.epsilon)
+            
+            # Add weight decay
+            if self.weight_decay > 0:
+                update += self.weight_decay * param_float
+            
+            # Apply update
+            updated_param = param_float - update
+            
+            # Gradient clipping for stability
+            param_norm = torch.norm(updated_param)
+            if param_norm > 10.0:  # Clip large parameters
+                updated_param = updated_param * (10.0 / param_norm)
+            
+            updated_params.append(updated_param)
+        
+        # Convert back to Parameters
+        updated_parameters = Parameters(
+            tensors=[param.detach().numpy() for param in updated_params],
+            tensor_type="numpy.ndarray"
+        )
+        
+        # Store current global parameters
+        self.current_global_params = updated_parameters
+        
+        # 3.3.4 Metrics aggregation
+        aggregated_metrics = self._aggregate_training_metrics(client_metrics, weights_list)
+        
+        # Track loss history for adaptive scheduling
+        if 'train_loss' in aggregated_metrics:
+            self.loss_history.append(aggregated_metrics['train_loss'])
+            # Keep only recent history
+            if len(self.loss_history) > 10:
+                self.loss_history = self.loss_history[-10:]
+        
+        # Log aggregated metrics
+        self.logger.info(f"Aggregated training metrics:")
+        for key, value in aggregated_metrics.items():
+            if isinstance(value, (int, float)):
+                self.logger.info(f"  {key}: {value:.4f}")
+        
+        return updated_parameters, aggregated_metrics
+    
     def aggregate_evaluate(
         self,
         server_round: int,
-        results: List[Tuple[ClientProxy, fl.common.EvaluateRes]],
-        failures: List[Tuple[ClientProxy, fl.common.EvaluateRes] | BaseException],
+        results: List[Tuple[ClientProxy, EvaluateRes]],
+        failures: List[Tuple[ClientProxy, EvaluateRes] | BaseException],
     ) -> Tuple[Optional[float], Dict[str, Scalar]]:
-        print(f"\nAGGREGATE EVALUATION RESULTS - Round {server_round}")
+        """
+        Aggregate evaluation results with comprehensive medical metrics
+        """
+        self.logger.info(f"AGGREGATE EVALUATION RESULTS - Round {server_round}")
         
-        # Log failures in detail
+        # Handle failures
         if failures:
-            print(f"⚠ Evaluation failures: {len(failures)}")
+            self.logger.warning(f"Evaluation failures: {len(failures)}")
             for i, failure in enumerate(failures):
-                print(f"  Failure {i+1}: {type(failure).__name__}: {str(failure)[:100]}")
+                self.logger.warning(f"  Failure {i+1}: {type(failure).__name__}")
         
-        # Check for valid results
         if not results:
-            print(f"❌ No successful evaluation results in round {server_round}")
+            self.logger.error(f"No successful evaluation results in round {server_round}")
             return None, {}
-
-        # Filter out results with 0 examples
+        
+        # Filter valid results
         valid_results = [res for res in results if res[1].num_examples > 0]
-
         if not valid_results:
-            print(f"❌ All evaluation results had 0 examples in round {server_round}")
+            self.logger.error(f"All evaluation results had 0 examples in round {server_round}")
             return None, {}
         
-        print(f"✓ Processing evaluation results from {len(valid_results)} clients")
+        self.logger.info(f"Processing evaluation results from {len(valid_results)} clients")
         
-        # Calculate client-wise metrics for detailed logging
-        client_metrics = []
-        total_examples = 0
+        # Extract metrics and compute weighted averages
+        total_examples = sum(res[1].num_examples for res in valid_results)
+        weighted_loss = 0.0
+        aggregated_metrics = {}
         
+        # Collect all metric keys
+        all_metric_keys = set()
+        for _, eval_res in valid_results:
+            if eval_res.metrics:
+                all_metric_keys.update(eval_res.metrics.keys())
+        
+        # Aggregate each metric
+        for metric_key in all_metric_keys:
+            weighted_sum = 0.0
+            total_weight = 0
+            
+            for client_proxy, eval_res in valid_results:
+                if eval_res.metrics and metric_key in eval_res.metrics:
+                    try:
+                        value = float(eval_res.metrics[metric_key])
+                        weight = eval_res.num_examples
+                        weighted_sum += value * weight
+                        total_weight += weight
+                    except (ValueError, TypeError):
+                        continue
+            
+            if total_weight > 0:
+                aggregated_metrics[metric_key] = weighted_sum / total_weight
+        
+        # Aggregate loss
         for client_proxy, eval_res in valid_results:
-            client_id = client_proxy.cid
-            num_examples = eval_res.num_examples
-            loss = eval_res.loss
-            metrics = eval_res.metrics
-            
-            total_examples += num_examples
-            client_info = {
-                'client_id': client_id,
-                'num_examples': num_examples,
-                'loss': loss,
-                'metrics': metrics
-            }
-            client_metrics.append(client_info)
-            
-            print(f"  Client {client_id}: Loss={loss:.4f}, Examples={num_examples}")
+            weight = eval_res.num_examples / total_examples
+            weighted_loss += eval_res.loss * weight
+        
+        # Performance tracking and analysis
+        self._track_global_performance(server_round, aggregated_metrics)
+        
+        # Log comprehensive results
+        self.logger.info(f"Round {server_round} Evaluation Summary:")
+        self.logger.info(f"  Total examples: {total_examples}")
+        self.logger.info(f"  Aggregated loss: {weighted_loss:.4f}")
+        
+        # Log key medical metrics
+        medical_metrics = ['dice_avg', 'dice_foreground_avg', 'iou_avg']
+        for metric in medical_metrics:
+            if metric in aggregated_metrics:
+                self.logger.info(f"  {metric}: {aggregated_metrics[metric]:.4f}")
+        
+        return weighted_loss, aggregated_metrics
+    
+    def _aggregate_training_metrics(
+        self, 
+        client_metrics: Dict[str, Dict], 
+        weights: List[int]
+    ) -> Dict[str, Scalar]:
+        """Aggregate training metrics from multiple clients"""
+        if not client_metrics:
+            return {}
+        
+        # Collect all metric keys
+        all_keys = set()
+        for metrics in client_metrics.values():
             if metrics:
-                for key, value in metrics.items():
-                    if isinstance(value, (int, float)):
-                        print(f"    {key}: {value:.4f}")
+                all_keys.update(metrics.keys())
         
-        # Aggregate using parent class
-        loss_aggregated, metrics_aggregated = super().aggregate_evaluate(server_round, valid_results, failures)
+        aggregated = {}
+        total_weight = sum(weights)
         
-        # Enhanced logging
-        print(f"\n📈 ROUND {server_round} SUMMARY:")
-        print(f"  Total examples evaluated: {total_examples}")
-        print(f"  Aggregated loss: {loss_aggregated:.4f}" if loss_aggregated is not None else "  Aggregated loss: None")
+        for key in all_keys:
+            weighted_sum = 0.0
+            valid_weight = 0
+            
+            for i, (cid, metrics) in enumerate(client_metrics.items()):
+                if metrics and key in metrics:
+                    try:
+                        value = float(metrics[key])
+                        weight = weights[i] if i < len(weights) else 1
+                        weighted_sum += value * weight
+                        valid_weight += weight
+                    except (ValueError, TypeError):
+                        continue
+            
+            if valid_weight > 0:
+                aggregated[key] = weighted_sum / valid_weight
         
-        if metrics_aggregated:
-            print(f"  📊 Key aggregated metrics:")
-            priority_metrics = ['dice_avg', 'dice_foreground_avg', 'iou_avg', 'eval_loss']
-            for metric in priority_metrics:
-                if metric in metrics_aggregated:
-                    print(f"    {metric}: {metrics_aggregated[metric]:.4f}")
-                    
-            # Show other metrics
-            other_metrics = {k: v for k, v in metrics_aggregated.items() if k not in priority_metrics}
-            if other_metrics:
-                print(f"  📋 Additional metrics:")
-                for key, value in other_metrics.items():
-                    if isinstance(value, (int, float)):
-                        print(f"    {key}: {value:.4f}")
-                    else:
-                        print(f"    {key}: {value}")
+        return aggregated
+    
+    def _track_global_performance(self, server_round: int, metrics: Dict[str, Scalar]):
+        """Track global model performance and convergence"""
+        # Store round metrics
+        self.round_metrics[f"round_{server_round}"] = metrics
+        
+        # Track best performance
+        current_metric = 0.0
+        if 'dice_foreground_avg' in metrics:
+            current_metric = float(metrics['dice_foreground_avg'])
+        elif 'dice_avg' in metrics:
+            current_metric = float(metrics['dice_avg'])
+        
+        if current_metric > self.best_global_metric:
+            improvement = current_metric - self.best_global_metric
+            self.best_global_metric = current_metric
+            self.rounds_without_improvement = 0
+            self.logger.info(f"🎉 NEW BEST GLOBAL MODEL! Improved by {improvement:.4f}")
+        else:
+            self.rounds_without_improvement += 1
+            self.logger.info(f"No improvement for {self.rounds_without_improvement} rounds")
             
-            # Store evaluation metrics and check for global improvement
-            self.round_metrics[f"round_{server_round}_eval"] = metrics_aggregated
-            
-            # Track global model performance (use dice_foreground_avg as primary metric)
-            current_global_metric = 0.0
-            if 'dice_foreground_avg' in metrics_aggregated:
-                current_global_metric = float(metrics_aggregated['dice_foreground_avg'])
-            elif 'dice_avg' in metrics_aggregated:
-                current_global_metric = float(metrics_aggregated['dice_avg'])
-            
-            if current_global_metric > self.best_global_metric:
-                improvement = current_global_metric - self.best_global_metric
-                self.best_global_metric = current_global_metric
-                self.rounds_without_improvement = 0
-                print(f"🎉 NEW BEST GLOBAL MODEL! Dice improved by {improvement:.4f}")
+            if self.rounds_without_improvement >= self.max_patience:
+                self.logger.warning(f"Early stopping recommended - no improvement for {self.max_patience} rounds")
+        
+        # Performance trend analysis
+        if server_round >= 3:
+            self._analyze_performance_trends(server_round)
+    
+    def _analyze_performance_trends(self, server_round: int):
+        """Analyze performance trends over recent rounds"""
+        recent_metrics = []
+        for r in range(max(1, server_round - 2), server_round + 1):
+            round_metrics = self.round_metrics.get(f"round_{r}", {})
+            if 'dice_foreground_avg' in round_metrics:
+                recent_metrics.append(float(round_metrics['dice_foreground_avg']))
+            elif 'dice_avg' in round_metrics:
+                recent_metrics.append(float(round_metrics['dice_avg']))
+        
+        if len(recent_metrics) >= 3:
+            trend = recent_metrics[-1] - recent_metrics[0]
+            if trend > 0.05:
+                self.logger.info(f"📈 Positive trend: +{trend:.3f} over last 3 rounds")
+            elif trend < -0.02:
+                self.logger.warning(f"📉 Negative trend: {trend:.3f} - consider reducing learning rate")
             else:
-                self.rounds_without_improvement += 1
-                print(f"📉 No improvement for {self.rounds_without_improvement} rounds (Best: {self.best_global_metric:.4f})")
-                
-                if self.rounds_without_improvement >= self.max_patience:
-                    print(f"🛑 EARLY STOPPING RECOMMENDATION: No improvement for {self.max_patience} rounds")
-                    print(f"   Consider stopping training or adjusting hyperparameters")
+                self.logger.info(f"📊 Stable performance: {trend:+.3f} change")
+
+# =============================================================================
+# 4. GLOBAL MODEL MANAGEMENT
+# =============================================================================
+
+def create_global_model(config: Dict[str, Any]) -> OptimizedRobustMedVFL_UNet:
+    """
+    Create and initialize global model with optimal configuration
+    """
+    # Extract model configuration
+    num_classes = config.get('num_classes', ServerConfig.NUM_CLASSES)
+    dropout_rate = config.get('dropout_rate', 0.1)
+    
+    # Default balanced pruning configuration
+    pruning_config = {
+        'noise_processing_levels': [0, 1],
+        'maxwell_solver_levels': [0, 1],
+        'dropout_positions': [0],
+        'skip_quantum_noise': False
+    }
+    
+    # Create model
+    model = OptimizedRobustMedVFL_UNet(
+        n_channels=1,
+        n_classes=num_classes,
+        dropout_rate=dropout_rate,
+        pruning_config=pruning_config
+    ).to(DEVICE)
+    
+    # Initialize weights properly
+    def init_weights(m):
+        if isinstance(m, nn.Conv2d):
+            nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.BatchNorm2d):
+            nn.init.constant_(m.weight, 1)
+            nn.init.constant_(m.bias, 0)
+    
+    model.apply(init_weights)
+    
+    print(f"✓ Global model created with {sum(p.numel() for p in model.parameters())} parameters")
+    return model
+
+def get_evaluate_fn(
+    global_model: OptimizedRobustMedVFL_UNet,
+    test_dataloader: Optional[DataLoader],
+    config: Dict[str, Any]
+) -> Callable:
+    """
+    Create evaluation function for global model assessment
+    """
+    def evaluate(server_round: int, parameters: Parameters, config_dict: Dict[str, Scalar]) -> Optional[Tuple[float, Dict[str, Scalar]]]:
+        """Evaluate global model on test dataset"""
+        if test_dataloader is None:
+            print(f"Warning: No test data available for global evaluation")
+            return None
+        
+        # Set model parameters
+        params_dict = zip(global_model.state_dict().keys(), parameters.tensors)
+        state_dict = OrderedDict({k: torch.tensor(v) for k, v in params_dict})
+        global_model.load_state_dict(state_dict, strict=True)
+        
+        # Evaluate model
+        try:
+            metrics = evaluate_metrics(global_model, test_dataloader, DEVICE, ServerConfig.NUM_CLASSES)
             
-            # Performance trend analysis
-            if server_round >= 3:
-                print(f"\n📊 PERFORMANCE TREND ANALYSIS:")
-                recent_rounds = []
-                for r in range(max(1, server_round-2), server_round+1):
-                    eval_metrics = self.round_metrics.get(f"round_{r}_eval", {})
-                    dice_score = 0.0
-                    if 'dice_foreground_avg' in eval_metrics:
-                        dice_score = float(eval_metrics['dice_foreground_avg'])
-                    elif 'dice_avg' in eval_metrics:
-                        dice_score = float(eval_metrics['dice_avg'])
-                    recent_rounds.append(dice_score)
-                
-                if len(recent_rounds) >= 3:
-                    trend = recent_rounds[-1] - recent_rounds[0]
-                    if trend > 0.05:
-                        print(f"  📈 Positive trend: +{trend:.3f} over last 3 rounds")
-                    elif trend < -0.02:
-                        print(f"  📉 Negative trend: {trend:.3f} over last 3 rounds")
-                        print(f"     Consider reducing learning rate or adding regularization")
-                    else:
-                        print(f"  📊 Stable performance: {trend:+.3f} change over last 3 rounds")
+            # Calculate primary metrics
+            avg_dice = np.mean(metrics['dice_scores'])
+            fg_dice = np.mean(metrics['dice_scores'][1:]) if len(metrics['dice_scores']) > 1 else avg_dice
+            avg_iou = np.mean(metrics['iou'])
+            
+            # Create evaluation metrics dictionary
+            eval_metrics = {
+                'global_dice_avg': avg_dice,
+                'global_dice_foreground': fg_dice,
+                'global_iou_avg': avg_iou,
+                'global_precision_avg': np.mean(metrics['precision']),
+                'global_recall_avg': np.mean(metrics['recall']),
+                'global_f1_avg': np.mean(metrics['f1_score']),
+            }
+            
+            # Add per-class metrics
+            for i, class_name in enumerate(ServerConfig.CLASS_NAMES):
+                if i < len(metrics['dice_scores']):
+                    eval_metrics[f'global_dice_{class_name.lower()}'] = metrics['dice_scores'][i]
+                    eval_metrics[f'global_iou_{class_name.lower()}'] = metrics['iou'][i]
+            
+            # Use negative dice as loss (lower is better)
+            loss = 1.0 - fg_dice
+            
+            print(f"Global evaluation - Round {server_round}:")
+            print(f"  Global Dice (FG): {fg_dice:.4f}")
+            print(f"  Global IoU: {avg_iou:.4f}")
+            
+            return loss, eval_metrics
+            
+        except Exception as e:
+            print(f"Error in global evaluation: {e}")
+            return None
+    
+    return evaluate
+
+def load_global_test_data(config: Dict[str, Any]) -> Optional[DataLoader]:
+    """
+    Load global test dataset for server-side evaluation
+    """
+    try:
+        # Try to load test data from configured path
+        test_data_path = config.get('test_data_path', '/Users/alvinluong/Documents/Federated_Learning/ACDC/database/testing')
         
-        return loss_aggregated, metrics_aggregated
+        if os.path.exists(test_data_path):
+            print(f"Loading global test data from: {test_data_path}")
+            
+            # Create test dataloader using ACDC dataset
+            test_dataloader = create_acdc_dataloader(
+                data_dir=test_data_path,
+                batch_size=config.get('test_batch_size', 4),
+                shuffle=False,
+                augment=False,  # No augmentation for testing
+                num_workers=0
+            )
+            
+            print(f"✓ Global test data loaded: {len(test_dataloader.dataset)} samples")
+            return test_dataloader
+            
+        else:
+            print(f"Warning: Test data path not found: {test_data_path}")
+            return None
+            
+    except Exception as e:
+        print(f"Error loading global test data: {e}")
+        return None
 
-# Define enhanced evaluation metrics aggregation
-def evaluate_metrics_aggregation_fn(metrics_list):
-    """Enhanced evaluation metrics aggregation with weighted averaging."""
-    if len(metrics_list) == 0:
-        return {}
+# =============================================================================
+# 5. CONFIGURATION MANAGEMENT
+# =============================================================================
+
+def get_fit_config(
+    server_round: int, 
+    convergence_status: str, 
+    client_capabilities: Dict[str, Any]
+) -> Dict[str, Scalar]:
+    """
+    Get adaptive fit configuration based on round and client capabilities
+    """
+    # Base configuration
+    config = {
+        "server_round": server_round,
+        "learning_rate": ServerConfig.DEFAULT_LEARNING_RATE,
+        "local_epochs": ServerConfig.DEFAULT_LOCAL_EPOCHS,
+        "batch_size": ServerConfig.DEFAULT_BATCH_SIZE,
+        "num_classes": ServerConfig.NUM_CLASSES,
+    }
+    
+    # Adaptive adjustments based on convergence
+    if convergence_status == "poor":
+        config["learning_rate"] *= 0.5
+        config["local_epochs"] = min(config["local_epochs"] + 1, 8)
+    elif convergence_status == "excellent":
+        config["local_epochs"] = max(config["local_epochs"] - 1, 3)
+    
+    # Client capability adjustments
+    if client_capabilities.get("low_memory", False):
+        config["batch_size"] = max(config["batch_size"] // 2, 2)
+    
+    if client_capabilities.get("high_compute", False):
+        config["local_epochs"] = min(config["local_epochs"] + 1, 10)
+    
+    return config
+
+def get_evaluate_config(server_round: int, evaluation_depth: str) -> Dict[str, Scalar]:
+    """
+    Get evaluation configuration based on round and desired depth
+    """
+    config = {
+        "server_round": server_round,
+        "num_classes": ServerConfig.NUM_CLASSES,
+        "collect_detailed_metrics": evaluation_depth == "comprehensive",
+        "collect_per_class_metrics": True,
+        "collect_medical_metrics": True,
+    }
+    
+    # Comprehensive evaluation every 5 rounds
+    if server_round % 5 == 0:
+        config["evaluation_depth"] = "comprehensive"
+        config["collect_physics_metrics"] = True
+        config["save_predictions"] = True
+    else:
+        config["evaluation_depth"] = "standard"
+        config["collect_physics_metrics"] = False
+        config["save_predictions"] = False
+    
+    return config
+
+# =============================================================================
+# 6. SERVER FACTORY FUNCTION
+# =============================================================================
+
+def server_fn(context: Context) -> ServerAppComponents:
+    """
+    Create server components with comprehensive configuration
+    Factory function for Flower ServerApp
+    """
+    print("🚀 INITIALIZING ENHANCED MEDICAL FEDERATED LEARNING SERVER")
+    print("="*70)
+    
+    # 6.1 Context Processing and Validation
+    try:
+        # Extract configuration from context
+        run_config = context.run_config
         
-    # Handle different metric formats
-    processed_metrics = []
-    for metric in metrics_list:
-        if isinstance(metric, tuple) and len(metric) >= 2:
-            # Format: (num_examples, metrics_dict)
-            num_examples, metrics_dict = metric[0], metric[1]
-            if isinstance(metrics_dict, dict):
-                processed_metrics.append((num_examples, metrics_dict))
-        elif isinstance(metric, dict):
-            # Direct metrics dict
-            processed_metrics.append((1, metric))  # Default weight of 1
-    
-    if not processed_metrics:
-        return {}
-    
-    # Collect all unique metric keys
-    all_keys = set()
-    for _, metrics_dict in processed_metrics:
-        if isinstance(metrics_dict, dict):
-            all_keys.update(metrics_dict.keys())
-    
-    # Weighted aggregation
-    aggregated = {}
-    total_examples = sum(num_examples for num_examples, _ in processed_metrics)
-    
-    for key in all_keys:
-        values_and_weights = []
+        # Server configuration with defaults
+        server_config = {
+            'num_rounds': run_config.get('num_rounds', ServerConfig.DEFAULT_ROUNDS),
+            'learning_rate': run_config.get('learning_rate', ServerConfig.DEFAULT_LEARNING_RATE),
+            'min_fit_clients': run_config.get('min_fit_clients', ServerConfig.MIN_FIT_CLIENTS),
+            'min_evaluate_clients': run_config.get('min_evaluate_clients', ServerConfig.MIN_EVALUATE_CLIENTS),
+            'fraction_fit': run_config.get('fraction_fit', ServerConfig.DEFAULT_FRACTION_FIT),
+            'fraction_evaluate': run_config.get('fraction_evaluate', ServerConfig.DEFAULT_FRACTION_EVALUATE),
+            'test_data_path': run_config.get('test_data_path', None),
+            'enable_global_evaluation': run_config.get('enable_global_evaluation', True),
+            'noise_adaptation': run_config.get('noise_adaptation', True),
+            'physics_scheduling': run_config.get('physics_scheduling', True),
+            'progressive_complexity': run_config.get('progressive_complexity', True),
+        }
         
-        for num_examples, metrics_dict in processed_metrics:
-            if key in metrics_dict:
-                try:
-                    value = float(metrics_dict[key])
-                    values_and_weights.append((value, num_examples))
-                except (ValueError, TypeError):
-                    # Try to parse string representations
-                    if isinstance(metrics_dict[key], str):
-                        try:
-                            # Handle formatted strings like "[0.1234, 0.5678]"
-                            if metrics_dict[key].startswith('[') and metrics_dict[key].endswith(']'):
-                                continue  # Skip formatted array strings
-                            value = float(metrics_dict[key])
-                            values_and_weights.append((value, num_examples))
-                        except ValueError:
-                            continue
+        print("✓ Configuration extracted from context")
+        print(f"  Rounds: {server_config['num_rounds']}")
+        print(f"  Learning rate: {server_config['learning_rate']}")
+        print(f"  Min fit clients: {server_config['min_fit_clients']}")
         
-        if values_and_weights:
-            # Compute weighted average
-            weighted_sum = sum(value * weight for value, weight in values_and_weights)
-            total_weight = sum(weight for _, weight in values_and_weights)
-            aggregated[key] = weighted_sum / total_weight
+    except Exception as e:
+        print(f"⚠ Error extracting configuration: {e}")
+        print("Using default configuration")
+        server_config = {
+            'num_rounds': ServerConfig.DEFAULT_ROUNDS,
+            'learning_rate': ServerConfig.DEFAULT_LEARNING_RATE,
+            'min_fit_clients': ServerConfig.MIN_FIT_CLIENTS,
+            'min_evaluate_clients': ServerConfig.MIN_EVALUATE_CLIENTS,
+            'fraction_fit': ServerConfig.DEFAULT_FRACTION_FIT,
+            'fraction_evaluate': ServerConfig.DEFAULT_FRACTION_EVALUATE,
+            'enable_global_evaluation': True,
+            'noise_adaptation': True,
+            'physics_scheduling': True,
+            'progressive_complexity': True,
+        }
     
-    return aggregated
+    # 6.2 Strategy Initialization
+    print("\n🧠 INITIALIZING MEDICAL FEDADAM STRATEGY")
+    
+    # Global model setup
+    global_model = create_global_model(server_config)
+    
+    # Global test data loading
+    test_dataloader = None
+    if server_config.get('enable_global_evaluation', True):
+        test_dataloader = load_global_test_data(server_config)
+    
+    # Evaluation function setup
+    evaluate_fn = None
+    if test_dataloader is not None:
+        evaluate_fn = get_evaluate_fn(global_model, test_dataloader, server_config)
+        print("✓ Global evaluation function configured")
+    else:
+        print("⚠ Global evaluation disabled - no test data available")
+    
+    # 6.3 Server Components Assembly
+    # Strategy instantiation
+    strategy = MedicalFedAdam(
+        learning_rate=server_config['learning_rate'],
+        min_fit_clients=server_config['min_fit_clients'],
+        min_evaluate_clients=server_config['min_evaluate_clients'],
+        fraction_fit=server_config['fraction_fit'],
+        fraction_evaluate=server_config['fraction_evaluate'],
+        noise_adaptation=server_config['noise_adaptation'],
+        physics_scheduling=server_config['physics_scheduling'],
+        progressive_complexity=server_config['progressive_complexity'],
+        evaluate_fn=evaluate_fn,
+        num_rounds=server_config['num_rounds'],
+    )
+    
+    print("✓ MedicalFedAdam strategy initialized")
+    
+    # Server configuration
+    config = ServerConfig(
+        num_rounds=server_config['num_rounds'],
+        round_timeout=ServerConfig.COMPUTATION_TIMEOUT
+    )
+    
+    print("✓ Server configuration created")
+    
+    # Components integration
+    components = ServerAppComponents(
+        strategy=strategy,
+        config=config
+    )
+    
+    print("✓ Server components assembled")
+    print("="*70)
+    print("🌸 MEDICAL FEDERATED LEARNING SERVER READY")
+    print(f"📊 Configuration Summary:")
+    print(f"  • Rounds: {server_config['num_rounds']}")
+    print(f"  • Strategy: MedicalFedAdam with adaptive complexity")
+    print(f"  • Global evaluation: {'Enabled' if evaluate_fn else 'Disabled'}")
+    print(f"  • Noise adaptation: {'Enabled' if server_config['noise_adaptation'] else 'Disabled'}")
+    print(f"  • Physics scheduling: {'Enabled' if server_config['physics_scheduling'] else 'Disabled'}")
+    print(f"  • Progressive complexity: {'Enabled' if server_config['progressive_complexity'] else 'Disabled'}")
+    print("="*70)
+    
+    return components
 
-# Enhanced strategy configuration with improved hyperparameters
-strategy = FedAvgStrategy(
-    min_fit_clients=1,      # Minimum clients for training
-    min_evaluate_clients=1, # Minimum clients for evaluation  
-    min_available_clients=1, # Minimum available clients
-    fraction_fit=1.0,       # Use all available clients for training
-    fraction_evaluate=1.0,  # Use all available clients for evaluation
-    timeout_fit=300,        # 5 minutes timeout for training
-    timeout_evaluate=300,   # 5 minutes timeout for evaluation
-    num_rounds=8,           # Increased rounds to test performance improvements
-)
+# =============================================================================
+# 7. UTILITY FUNCTIONS
+# =============================================================================
 
-# Enhanced ServerConfig
-config = fl.server.ServerConfig(
-    num_rounds=8,           # Number of federated learning rounds (increased)
-    round_timeout=600       # 10 minutes timeout per round
-)
+def analyze_convergence(loss_history: List[float], patience: int = 3) -> Dict[str, Any]:
+    """
+    Analyze convergence patterns and provide recommendations
+    """
+    if len(loss_history) < 3:
+        return {"status": "insufficient_data", "recommendation": "continue"}
+    
+    recent_losses = loss_history[-patience:]
+    
+    # Check for improvement
+    if all(recent_losses[i] >= recent_losses[i+1] for i in range(len(recent_losses)-1)):
+        return {"status": "improving", "recommendation": "continue"}
+    
+    # Check for stagnation
+    if max(recent_losses) - min(recent_losses) < 0.001:
+        return {"status": "stagnant", "recommendation": "reduce_lr"}
+    
+    # Check for divergence
+    if recent_losses[-1] > recent_losses[0] * 1.1:
+        return {"status": "diverging", "recommendation": "reduce_lr_significantly"}
+    
+    return {"status": "stable", "recommendation": "continue"}
 
-# Increase max message size for large models (reduced for stability)
-MAX_MESSAGE_LENGTH = 512 * 1024 * 1024  # 512MB in bytes
+def estimate_remaining_time(round_times: List[float], current_round: int, total_rounds: int) -> str:
+    """
+    Estimate remaining training time based on historical round times
+    """
+    if not round_times or current_round >= total_rounds:
+        return "Unknown"
+    
+    avg_time = np.mean(round_times[-5:])  # Use last 5 rounds
+    remaining_rounds = total_rounds - current_round
+    remaining_seconds = avg_time * remaining_rounds
+    
+    hours = int(remaining_seconds // 3600)
+    minutes = int((remaining_seconds % 3600) // 60)
+    
+    if hours > 0:
+        return f"{hours}h {minutes}m"
+    else:
+        return f"{minutes}m"
 
-# Create enhanced ServerApp
-app = fl.server.ServerApp(
-    config=config,
-    strategy=strategy
-)
+# =============================================================================
+# 8. SERVERAPP CREATION AND EXPORT
+# =============================================================================
+
+# Create the ServerApp with our factory function
+app = ServerApp(server_fn=server_fn)
+
+# =============================================================================
+# 9. MAIN EXECUTION AND CLI SUPPORT
+# =============================================================================
 
 if __name__ == "__main__":
-    print("🚀 ENHANCED FEDERATED LEARNING SERVER v2.0")
-    print("="*60)
-    print("🔧 PERFORMANCE OPTIMIZATIONS:")
-    print("✓ Adaptive learning rate scheduling (1e-4 → 5e-5)")
-    print("✓ Reduced epoch scheduling (3-4 epochs per round)")
-    print("✓ Weight decay regularization (1e-5)")
-    print("✓ Dropout regularization (0.1)")
-    print("✓ Gradient clipping (max_norm=1.0)")
-    print("✓ Early stopping (patience=2 epochs)")
-    print("✓ Cosine annealing LR scheduler within rounds")
-    print("✓ AdamW optimizer with better regularization")
+    print("🌸 ENHANCED MEDICAL FEDERATED LEARNING SERVER v3.0")
+    print("="*70)
+    print("🔧 ADVANCED FEATURES:")
+    print("✓ MedicalFedAdam strategy with adaptive optimization")
+    print("✓ Progressive model complexity scheduling")
+    print("✓ Medical domain-specific noise adaptation")
+    print("✓ Physics-informed constraint scheduling")
+    print("✓ Intelligent client selection based on quality")
+    print("✓ Comprehensive medical metrics aggregation")
+    print("✓ Global model evaluation with clinical metrics")
+    print("✓ Convergence analysis and early stopping")
+    print("✓ Resource-aware client management")
+    print("✓ Production-ready error handling and logging")
     print("")
-    print("📊 MONITORING FEATURES:")
-    print("✓ Global model performance tracking")
-    print("✓ Performance trend analysis")
-    print("✓ Automatic early stopping recommendations")
-    print("✓ Training stability monitoring")
-    print("✓ Comprehensive round-by-round logging")
-    print("="*60)
+    print("📊 MEDICAL SPECIALIZATIONS:")
+    print("✓ ACDC cardiac segmentation optimization")
+    print("✓ Medical-safe data augmentation")
+    print("✓ Clinical performance metrics (Dice, IoU)")
+    print("✓ Physics-informed Maxwell equation constraints")
+    print("✓ Quantum noise injection for robustness")
+    print("✓ Adaptive pruning for computational efficiency")
+    print("="*70)
     
-    print("\nTo run this server:")
-    print("1. CLI (recommended): flower-server --app app_server:app")
+    print("\n🚀 DEPLOYMENT OPTIONS:")
+    print("1. CLI (recommended): flower-server --app fl_core.app_server:app")
     print("2. Direct execution: python app_server.py --start-server")
+    print("3. Custom config: flower-server --app fl_core.app_server:app --run-config config.toml")
     
-    # Direct execution option
+    # Direct execution option for development
     import sys
     if "--start-server" in sys.argv:
         try:
-            print("\n🌸 Starting Flower server...")
-            fl.server.start_server(
-                server_address="0.0.0.0:8080", 
-                config=config, 
-                strategy=strategy,
-                grpc_max_message_length=MAX_MESSAGE_LENGTH,
-                certificates=None  # No SSL
+            print("\n🌸 Starting Flower server directly...")
+            
+            # Create a simple context for direct execution
+            from flwr.common import Context
+            context = Context(
+                run_id=0,
+                node_id=0,
+                node_config={},
+                state={},
+                run_config={
+                    'num_rounds': 10,
+                    'learning_rate': 1e-4,
+                    'min_fit_clients': 1,
+                    'enable_global_evaluation': True,
+                }
             )
+            
+            # Get server components
+            components = server_fn(context)
+            
+            # Start server
+            fl.server.start_server(
+                server_address="0.0.0.0:8080",
+                config=components.config,
+                strategy=components.strategy,
+                grpc_max_message_length=ServerConfig.MAX_MESSAGE_LENGTH,
+                certificates=None  # No SSL for development
+            )
+            
         except Exception as e:
             print(f"❌ Server execution failed: {type(e).__name__}: {str(e)}")
+            import traceback
+            traceback.print_exc()
     else:
         print("\n💡 Use --start-server flag to run directly, or use the CLI command above.")
+        print("📖 For production deployment, use the CLI with proper configuration files.")
 
