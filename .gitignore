@@ -50,9 +50,7 @@ ACDC_preprocessed/
 *.h5
 *.hdf5
 
-# Processed data and results (optional - comment out if you want to track these)
-data/processed/
-data/partitions/
+# Results directories (optional - comment out if you want to track these)
 results/
 figures/
 outputs/
