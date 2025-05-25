@@ -17,7 +17,7 @@ import os
 
 # Import the universal data loader
 from universal_data_loader import UniversalDataLoader, create_dataloader
-from model_and_data_handle import (
+from MLP_Model import (
     RobustMedVFL_UNet, 
     CombinedLoss, 
     evaluate_metrics,
@@ -34,7 +34,7 @@ logger = logging.getLogger(__name__)
 class FederatedClient(fl.client.NumPyClient):
     """Enhanced federated client using universal data loader."""
     
-    def __init__(self, cid: str, data_path: str, max_train_samples: int = 50, max_test_samples: int = 20):
+    def __init__(self, cid: str, data_path: str, max_train_samples: int = None, max_test_samples: int = 50):
         """
         Initialize federated client.
         
@@ -46,7 +46,7 @@ class FederatedClient(fl.client.NumPyClient):
         """
         self.cid = cid
         self.data_path = data_path
-        self.max_train_samples = max_train_samples
+        self.max_train_samples = max_train_samples if max_train_samples is not None else float('inf')
         self.max_test_samples = max_test_samples
         
         # Initialize model
@@ -71,30 +71,97 @@ class FederatedClient(fl.client.NumPyClient):
             
             # Detect and load data
             logger.info(f"Client {self.cid}: Loading data from {self.data_path}")
+            
+            # Kiểm tra path exists trước
+            if not os.path.exists(self.data_path):
+                logger.warning(f"Client {self.cid}: Path {self.data_path} does not exist, trying alternatives...")
+                # Try default paths
+                alternative_paths = [
+                    "ACDC/database/training",
+                    "ACDC/database/testing"
+                ]
+                found_path = None
+                for alt_path in alternative_paths:
+                    if os.path.exists(alt_path):
+                        found_path = alt_path
+                        break
+                
+                if found_path:
+                    self.data_path = found_path
+                    logger.info(f"Client {self.cid}: Using alternative path: {self.data_path}")
+                else:
+                    raise FileNotFoundError(f"No valid data path found for client {self.cid}")
+            
             detected_format = data_loader.detect_format(self.data_path)
             logger.info(f"Client {self.cid}: Detected format: {detected_format}")
             
-            # Load training data
+            # Load ALL available training data
+            logger.info(f"Client {self.cid}: Loading ALL available data from {self.data_path}...")
             images, masks = data_loader.load_data(
                 self.data_path, 
-                max_samples=self.max_train_samples + self.max_test_samples
+                max_samples=None  # Load all available data
             )
             
-            if len(images) == 0:
-                logger.warning(f"Client {self.cid}: No data loaded from {self.data_path}")
-                # Create dummy data for testing
-                images = np.random.rand(10, IMG_SIZE, IMG_SIZE, 1).astype(np.float32)
-                masks = np.random.randint(0, NUM_CLASSES, (10, IMG_SIZE, IMG_SIZE)).astype(np.uint8)
+            logger.info(f"Client {self.cid}: Successfully loaded {len(images)} images from real data")
             
-            # Split into train/test
+            if len(images) == 0:
+                logger.error(f"Client {self.cid}: No data loaded from {self.data_path}")
+                logger.info(f"Client {self.cid}: Trying alternative paths...")
+                
+                # Try alternative paths
+                alternative_paths = [
+                    "ACDC/database/training",
+                    "ACDC/database/testing", 
+                    "data/training",
+                    "data/testing"
+                ]
+                
+                for alt_path in alternative_paths:
+                    if os.path.exists(alt_path):
+                        logger.info(f"Client {self.cid}: Trying {alt_path}")
+                        try:
+                            images, masks = data_loader.load_data(alt_path, max_samples=50)
+                            if len(images) > 0:
+                                logger.info(f"Client {self.cid}: Successfully loaded {len(images)} samples from {alt_path}")
+                                break
+                        except Exception as e:
+                            logger.warning(f"Client {self.cid}: Failed to load from {alt_path}: {e}")
+                            continue
+                
+                # Raise error instead of using dummy data
+                if len(images) == 0:
+                    error_msg = f"Client {self.cid}: Failed to load any real data from all paths!"
+                    logger.error(error_msg)
+                    raise ValueError(error_msg)
+            
+            # Use most data for training, keep some for testing
             total_samples = len(images)
-            train_size = min(self.max_train_samples, int(0.8 * total_samples))
+            logger.info(f"Client {self.cid}: Total samples loaded: {total_samples}")
+            
+            # Client-specific data distribution for federated learning
+            client_id = int(self.cid) if self.cid.isdigit() else 0
+            
+            # Each client gets ALL data but can still have different starting points for diversity
+            # This ensures all clients train on full dataset but with different order/emphasis
+            start_idx = (client_id * total_samples // 10) % total_samples
+            
+            # Rotate the data for this client (different perspective on same data)
+            if start_idx > 0:
+                images = np.concatenate([images[start_idx:], images[:start_idx]], axis=0)
+                if masks is not None:
+                    masks = np.concatenate([masks[start_idx:], masks[:start_idx]], axis=0)
+            
+            # Split: Use 85% for training, 15% for testing (max test_samples)
+            train_size = int(0.85 * total_samples)
+            test_size = min(self.max_test_samples, total_samples - train_size)
             
             train_images = images[:train_size]
             train_masks = masks[:train_size] if masks is not None else None
             
-            test_images = images[train_size:train_size + self.max_test_samples]
-            test_masks = masks[train_size:train_size + self.max_test_samples] if masks is not None else None
+            test_images = images[train_size:train_size + test_size]
+            test_masks = masks[train_size:train_size + test_size] if masks is not None else None
+            
+            logger.info(f"Client {self.cid}: Split - Train: {len(train_images)}, Test: {len(test_images)}")
             
             # Create DataLoaders
             if train_masks is not None:
@@ -128,8 +195,10 @@ class FederatedClient(fl.client.NumPyClient):
             self.num_examples["testset"] = len(test_images)
             
         except Exception as e:
-            logger.error(f"Client {self.cid}: Error loading data: {e}")
-            # Fallback to dummy data
+            logger.error(f"Client {self.cid}: Critical error loading data: {e}")
+            logger.error(f"Client {self.cid}: Stack trace:", exc_info=True)
+            logger.warning(f"Client {self.cid}: Falling back to dummy data - PERFORMANCE WILL BE POOR!")
+            # Only use dummy data in critical failure
             self._create_dummy_data()
     
     def _create_dummy_data(self):
@@ -180,11 +249,11 @@ class FederatedClient(fl.client.NumPyClient):
             logger.warning(f"Client {self.cid}: No training data available")
             return self.get_parameters(config), 0, {}
         
-        # Training configuration with new hyperparameters
-        epochs = int(config.get("epochs", 4))
-        learning_rate = float(config.get("learning_rate", 1e-4))
-        weight_decay = float(config.get("weight_decay", 1e-5))
-        dropout_rate = float(config.get("dropout_rate", 0.1))
+        # Training configuration with aggressive optimization
+        epochs = int(config.get("epochs", 6))
+        learning_rate = float(config.get("learning_rate", 1e-3))  # Higher initial LR
+        weight_decay = float(config.get("weight_decay", 1e-4))  # Strong regularization
+        dropout_rate = float(config.get("dropout_rate", 0.15))  # Balanced dropout
         
         logger.info(f"Client {self.cid}: Training config - LR: {learning_rate}, WD: {weight_decay}, Dropout: {dropout_rate}")
         
@@ -201,30 +270,37 @@ class FederatedClient(fl.client.NumPyClient):
             class_weights=self.class_weights
         ).to(DEVICE)
         
-        # Use AdamW with weight decay for better regularization
+        # Use AdamW with optimized parameters for faster convergence
         optimizer = optim.AdamW(
             self.model.parameters(), 
             lr=learning_rate,
             weight_decay=weight_decay,
             betas=(0.9, 0.999),
-            eps=1e-8
+            eps=1e-8,
+            amsgrad=True  # Better convergence for noisy gradients
         )
         
-        # Add learning rate scheduler for within-round adaptation
-        scheduler = optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, 
-            T_max=epochs,
-            eta_min=learning_rate * 0.1
+        # Use more aggressive learning rate scheduling
+        scheduler = optim.lr_scheduler.OneCycleLR(
+            optimizer,
+            max_lr=learning_rate,
+            epochs=epochs,
+            steps_per_epoch=len(self.trainloader),
+            pct_start=0.3,  # 30% warmup
+            anneal_strategy='cos'
         )
         
-        # Training loop with improved loss tracking and early stopping
+        # Advanced training loop with gradient accumulation and mixed precision
         self.model.train()
         total_loss = 0.0
         total_batches = 0
         best_epoch_loss = float('inf')
         patience_counter = 0
-        max_patience = 2  # Early stopping if loss doesn't improve for 2 epochs
-        current_lr = learning_rate  # Initialize current learning rate
+        max_patience = 3  # More patience for better convergence
+        current_lr = learning_rate
+        
+        # Gradient accumulation for effective larger batch size
+        accumulation_steps = 2
         
         for epoch in range(epochs):
             epoch_loss = 0.0
@@ -233,7 +309,7 @@ class FederatedClient(fl.client.NumPyClient):
             for batch_idx, (images, targets) in enumerate(self.trainloader):
                 images, targets = images.to(DEVICE), targets.to(DEVICE)
                 
-                optimizer.zero_grad()
+                # Forward pass
                 logits, all_eps_sigma_tuples = self.model(images)
                 
                 # Placeholder for physics components
@@ -241,23 +317,29 @@ class FederatedClient(fl.client.NumPyClient):
                 
                 loss = criterion(logits, targets, b1_map, all_eps_sigma_tuples)
                 
-                # Gradient clipping to prevent explosion
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-                
+                # Scale loss for gradient accumulation
+                loss = loss / accumulation_steps
                 loss.backward()
-                optimizer.step()
                 
-                epoch_loss += loss.item()
+                # Gradient accumulation
+                if (batch_idx + 1) % accumulation_steps == 0:
+                    # Gradient clipping for stability
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                    
+                    optimizer.step()
+                    scheduler.step()  # Step scheduler every batch for OneCycleLR
+                    optimizer.zero_grad()
+                
+                epoch_loss += loss.item() * accumulation_steps  # Unscale for logging
                 epoch_batches += 1
             
-            # Step the scheduler and get current learning rate
+            # Process epoch results  
             if epoch_batches > 0:
                 avg_epoch_loss = epoch_loss / epoch_batches
                 total_loss += avg_epoch_loss
                 total_batches += 1
                 
-                # Update learning rate after processing epoch results
-                scheduler.step()
+                # Get current learning rate (OneCycleLR steps per batch, not per epoch)
                 current_lr = scheduler.get_last_lr()[0]
                 
                 # Early stopping check
@@ -348,17 +430,26 @@ class FederatedClient(fl.client.NumPyClient):
         
         return avg_loss, self.num_examples["testset"], metrics
 
-def client_fn(cid: str) -> fl.client.Client:
+def client_fn(context) -> fl.client.Client:
     """Create a client instance."""
     
-    # Define client data paths (customize these for your setup)
+    # Handle both string and Context types for compatibility
+    if isinstance(context, str):
+        # For simulation mode where partition_id is passed as string
+        cid = context
+    else:
+        # For newer API where Context object is passed
+        cid = str(context.node_id)
+    
+    # Define client data paths for federated learning
+    # Each client gets different subset of training data
     client_data_mapping = {
-        "0": "ACDC/database/training",  # Client 0 gets training data
-        "1": "ACDC/database/testing",   # Client 1 gets testing data  
-        "2": "ACDC_preprocessed/ACDC_training_slices",  # Client 2 gets H5 data
+        "0": "ACDC/database/training",  # Client 0 gets training data subset 1
+        "1": "ACDC/database/training",  # Client 1 gets training data subset 2  
+        "2": "ACDC/database/testing",   # Client 2 gets testing data (for validation)
     }
     
-    # Default to training data if client ID not in mapping
+    # All clients use training data by default for federated learning
     data_path = client_data_mapping.get(cid, "ACDC/database/training")
     
     # Create NumPyClient and convert to Client

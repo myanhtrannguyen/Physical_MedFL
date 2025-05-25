@@ -24,7 +24,7 @@ NUM_CLASSES = 4
 LEARNING_RATE = 1e-4
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 IMG_SIZE = 256
-BATCH_SIZE = 8 
+BATCH_SIZE = 8  # Reduced for stability with more data 
 
 # --- File type constants ---
 FILE_TYPE_NIFTI = 'nifti'

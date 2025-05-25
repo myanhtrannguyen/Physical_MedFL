@@ -23,7 +23,14 @@ dependencies = [
     "scikit-image",
     "scikit-learn",
     "numpy",
-    "h5py"  # Required by model_and_data_handle.py
+    "h5py",  # Required by model_and_data_handle.py
+    "nibabel",  # For NIfTI file handling
+    "opencv-python",  # For image processing
+    "pyyaml",  # For configuration files
+    "matplotlib",  # For visualization
+    "seaborn",  # For enhanced plotting
+    "tqdm",  # For progress bars
+    "pandas"  # For data analysis
 ]
 
 [tool.hatch.build.targets.wheel]
@@ -47,5 +54,5 @@ packages = ["."]
 # For running with `flower-simulation` (which is often easier for development)
 # you define the clientapp and serverapp that the simulation engine will use.
 [tool.flwr.app.components]
-clientapp = "app_client:app"
-serverapp = "app_server:app"
+clientapp = "src.fl_core.app_client:app"
+serverapp = "src.fl_core.app_server:app"

@@ -3,7 +3,6 @@ from typing import Dict, Optional, Tuple, List
 from flwr.server.client_proxy import ClientProxy
 from flwr.common import FitRes, Parameters, Scalar, FitIns, EvaluateIns
 
-# Assuming model_and_data_handle.py is in the same directory or accessible in PYTHONPATH
 # You might not need direct model access on the server if you're just aggregating.
 # However, if your strategy needs to evaluate a global model, you might.
 # For FedAvg, it's usually not needed on the server side directly for the strategy itself.
@@ -107,29 +106,30 @@ class FedAvgStrategy(fl.server.strategy.FedAvg):
         print(f"ROUND {server_round} - CONFIGURE FIT")
         print(f"{'='*60}")
         
-        # Optimized epoch scheduling: reduce epochs to prevent overfitting and early convergence
-        # Start with fewer epochs and maintain consistent across rounds
+        # Improved epoch scheduling for better convergence
         if server_round <= 2:
-            epochs = 3  # Fewer epochs early on to allow gradual learning
-        elif server_round <= 4:
-            epochs = 4  # Moderate epochs in middle rounds
+            epochs = 6  # More epochs early on for better learning
+        elif server_round <= 5:
+            epochs = 5  # Moderate epochs in middle rounds
         else:
-            epochs = 3  # Reduce again in later rounds to fine-tune
+            epochs = 4  # Reduce in later rounds for fine-tuning
         
-        # Dynamic learning rate: decrease over rounds to improve convergence
+        # Optimized learning rate for full dataset training
         if server_round == 1:
-            learning_rate = 1e-4  # Start with baseline
+            learning_rate = 5e-4  # Lower start with full data
         elif server_round <= 3:
-            learning_rate = 8e-5  # Reduce slightly for better convergence
+            learning_rate = 2e-4  # Medium rate for stable progress  
+        elif server_round <= 5:
+            learning_rate = 1e-4  # Lower for fine-tuning
         else:
-            learning_rate = 5e-5  # Lower rate for fine-tuning
+            learning_rate = 5e-5  # Very low for final convergence
         
         config: Dict[str, Scalar] = {
             "server_round": server_round,
             "epochs": epochs,
             "learning_rate": learning_rate,
-            "weight_decay": 1e-5,  # Add weight decay for regularization
-            "dropout_rate": 0.1,   # Add dropout for regularization
+            "weight_decay": 1e-4,  # Stronger regularization
+            "dropout_rate": 0.15,  # Moderate dropout for better generalization
             "total_rounds": self.num_rounds
         }
         
@@ -422,8 +422,8 @@ config = fl.server.ServerConfig(
     round_timeout=600       # 10 minutes timeout per round
 )
 
-# Increase max message size to 1GB for large models
-MAX_MESSAGE_LENGTH = 1024 * 1024 * 1024  # 1GB in bytes
+# Increase max message size for large models (reduced for stability)
+MAX_MESSAGE_LENGTH = 512 * 1024 * 1024  # 512MB in bytes
 
 # Create enhanced ServerApp
 app = fl.server.ServerApp(

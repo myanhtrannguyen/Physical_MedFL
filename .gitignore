@@ -1,11 +1,13 @@
 # filepath: /Users/alvinluong/Documents/Federated_Learning/.gitignore
-# Ignore virtual environments
+# Python virtual environments
 .venv_py310/
 .venv_py310/**
 .venv*/
 venv/
 env/
 .venv_*/
+.env
+.virtualenv
 **/site-packages/**/*.dylib
 **/site-packages/**/*.so
 **/site-packages/**/*.dll
@@ -15,34 +17,90 @@ __pycache__/
 *.py[cod]
 *$py.class
 *.so
+.Python
+*.pyc
+*.pyo
+*.pyd
+.cache/
 
 # Distribution / packaging
 dist/
 build/
 *.egg-info/
+.eggs/
+*.egg
+*.whl
 
 # PyTorch model files
 *.pt
 *.pth
 *.ckpt
+checkpoints/
+models/saved/
 
-# Data directories
-data/
+# Data directories - Raw data should not be committed
+data/raw/
+data/raw/**
 datasets/
 ACDC/
 ACDC_preprocessed/
+*.nii
+*.nii.gz
+*.dcm
+*.h5
+*.hdf5
+
+# Processed data and results (optional - comment out if you want to track these)
+data/processed/
+data/partitions/
+results/
+figures/
+outputs/
 
 # Jupyter Notebook
 .ipynb_checkpoints
+*.ipynb_checkpoints/
 
 # IDE files
 .idea/
 .vscode/
 *.swp
 *.swo
+.spyderproject
+.spyproject
 
 # Logs and temporary files
 logs/
 *.log
 tmp/
 temp/
+.tmp/
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# Documentation builds
+docs/_build/
+
+# Environment variables
+.env.local
+.env.development
+.env.test
+.env.production
+
+# Backup files
+*.bak
+*.backup
+*~
