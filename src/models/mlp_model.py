@@ -1,3 +1,11 @@
+"""
+Hello m, t đã cop y hệt file Kaggle xuống, h nó đang conflict khá là nhiều
+t đang fix lại,
+Bây h t cần m xem là tỏng model có phần nào m cần chuẩn hoá không, vì code AI
+cũng ngu vl
+Xem lại giúp bạn nhé
+"""
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -6,83 +14,23 @@ import numpy as np
 import time
 import os
 import h5py
-import glob
-import nibabel as nib
 from skimage.transform import resize
 from torch.utils.data import TensorDataset, DataLoader
 from sklearn.model_selection import train_test_split
-import torchvision.transforms as transforms
-import torchvision.transforms.functional as TF
-from sklearn.utils.class_weight import compute_class_weight
-
-# Import data handling modules
-from ..data.loader import create_dataloader, create_acdc_dataloader, create_dataloader_from_paths
-from ..data.dataset import ACDCDataset, InMemoryDataset, compute_class_weights as compute_dataset_class_weights
-from ..data.preprocessing import MedicalImagePreprocessor, DataAugmentation
-
-# Import evaluation metrics
-from ..utils.metrics import evaluate_metrics, compute_class_weights, print_metrics_summary
 
 # --- Configuration ---
-NUM_EPOCHS_CENTRALIZED = 50
+NUM_EPOCHS_CENTRALIZED = 50 
 NUM_CLASSES = 4
 LEARNING_RATE = 1e-4
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 IMG_SIZE = 256
-BATCH_SIZE = 8
+BATCH_SIZE = 8 
 
-# --- File type constants ---
-FILE_TYPE_NIFTI = 'nifti'
-FILE_TYPE_H5 = 'h5'
-
-# --- Optimized Data Augmentation ---
-class MedicalDataAugmentation:
-    def __init__(self, rotation_degrees=10, flip_prob=0.5, brightness_factor=0.15, contrast_factor=0.15):
-        # Reduced parameters for medical safety
-        self.rotation_degrees = rotation_degrees
-        self.flip_prob = flip_prob
-        self.brightness_factor = brightness_factor
-        self.contrast_factor = contrast_factor
-
-    def __call__(self, image, mask=None):
-        if isinstance(image, np.ndarray):
-            image = torch.from_numpy(image).float()
-        if mask is not None and isinstance(mask, np.ndarray):
-            mask = torch.from_numpy(mask).long()
-
-        # Random horizontal flip
-        if torch.rand(1) < self.flip_prob:
-            image = torch.flip(image, [-1])
-            if mask is not None:
-                mask = torch.flip(mask, [-1])
-
-        # Limited rotation for medical safety
-        if self.rotation_degrees > 0:
-            angle = torch.randint(-self.rotation_degrees, self.rotation_degrees + 1, (1,)).item()
-            if abs(angle) <= 10:
-                image = TF.rotate(image, angle, fill=[0.0])
-                if mask is not None:
-                    mask = TF.rotate(mask, angle, fill=[0.0])
-
-        # Reduced brightness/contrast adjustment
-        if torch.rand(1) < 0.3:  # Reduced probability
-            brightness = 1 + (torch.rand(1) - 0.5) * self.brightness_factor
-            image = image * brightness
-
-        if torch.rand(1) < 0.3:  # Reduced probability
-            contrast = 1 + (torch.rand(1) - 0.5) * self.contrast_factor
-            mean = image.mean()
-            image = (image - mean) * contrast + mean
-
-        image = torch.clamp(image, 0, 1)
-        return image, mask
-
-# --- Optimized Basic Components ---
+# --- Standard Convolutional Block ---
 class BasicConvBlock(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size=3, padding=1, use_bn=True):
         super().__init__()
-        layers = []
-        layers.append(nn.Conv2d(in_channels, out_channels, kernel_size=kernel_size, padding=padding, bias=not use_bn))
+        layers = [nn.Conv2d(in_channels, out_channels, kernel_size=kernel_size, padding=padding, bias=not use_bn)]
         if use_bn:
             layers.append(nn.BatchNorm2d(out_channels))
         layers.append(nn.ReLU(inplace=True))
@@ -91,118 +39,143 @@ class BasicConvBlock(nn.Module):
     def forward(self, x):
         return self.block(x)
 
-# --- Optimized ePURE Implementation ---
+# # --- Auxiliary Model Components ---
+# class ePUREPlaceholder(nn.Module):
+#     def __init__(self): super().__init__()
+#     def forward(self, x): return torch.zeros_like(x)
+
+# def adaptive_spline_smoothing_placeholder(x, noise_profile): return x
+
+# --- ePURE Implementation (Provided) ---
 class ePURE(nn.Module):
-    def __init__(self, in_channels, base_channels=24):  # Reduced from 32
+    def __init__(self, in_channels, base_channels=32):
         super().__init__()
         self.conv = nn.Sequential(
             nn.Conv2d(in_channels, base_channels, 3, padding=1),
             nn.ReLU(),
-            nn.Conv2d(base_channels, 1, 3, padding=1)
+            nn.Conv2d(base_channels, 1, 3, padding=1) # Ensure output is 1 channel for noise profile
         )
 
     def forward(self, x):
-        if x.dim() == 4 and x.shape[3] == 1:
-            x = x.permute(0, 3, 1, 2)
         x_float = x.float()
-        noise_map_raw = self.conv(x_float)
-        return noise_map_raw
 
-# --- Optimized Adaptive Spline Smoothing ---
-def adaptive_spline_smoothing(x, noise_profile, kernel_size=3, sigma=0.8):  # Reduced parameters
-    if x.dim() == 4 and x.shape[3] == 1:
-        x = x.permute(0, 3, 1, 2)
-    if noise_profile.dim() == 4 and noise_profile.shape[3] == 1:
-        noise_profile = noise_profile.permute(0, 3, 1, 2)
+        # Estimate a base noise map from the input features
+        noise_map_raw = self.conv(x_float) # Output is [B, 1, H, W]
 
-    x_float = x.float()
-    noise_profile_float = noise_profile.float()
+        # Simple approach: just output the learned map directly.
+        # The adaptive smoothing uses sigmoid, so the network learns to output values
+        # that sigmoid can map to appropriate blending weights.
+        noise_map = noise_map_raw # [B, 1, H, W]
+
+        return noise_map # Noise profile estimate (1 channel)
     
-    if noise_profile_float.size(1) != 1:
-        noise_profile_float = noise_profile_float[:, :1, :, :]
+import torchvision.transforms.functional as TF
+# --- Adaptive Spline Smoothing Implementation (Provided) ---
+def adaptive_spline_smoothing(x, noise_profile, kernel_size=5, sigma=1.0):
+    """
+    Áp dụng làm mịn thích nghi dựa trên noise_profile
+    - x: Ảnh đầu vào hoặc feature map [B, C, H, W]
+    - noise_profile: Bản đồ nhiễu [B, 1, H, W] (giá trị từ 0 đến 1)
+    - kernel_size/sigma: Tham số làm mịn Gaussian
+    """
+    # Ensure input is float for convolution
+    x_float = x.float()
 
-    # Simplified smoothing
+    # Ensure noise_profile is float and 1 channel
+    noise_profile_float = noise_profile.float()
+    if noise_profile_float.size(1) != 1:
+         print(f"Warning: Noise profile expected 1 channel but got {noise_profile_float.size(1)}. Using first channel.")
+         noise_profile_float = noise_profile_float[:, :1, :, :]
+
+
+    # Bước 1: Làm mịn ảnh bằng Gaussian blur
+    # Apply Gaussian blur channel-wise
+    # kernel_size can be a single int or a tuple (h, w). sigma same.
+    # Ensure kernel_size is a tuple if needed, or check F.gaussian_blur docs.
+    # F.gaussian_blur expects kernel_size as a tuple of ints (h, w).
+    # If kernel_size is an int, it uses that for both dims.
     if isinstance(kernel_size, int):
         kernel_size_tuple = (kernel_size, kernel_size)
     else:
         kernel_size_tuple = kernel_size
 
     if isinstance(sigma, (int, float)):
-        sigma_tuple = (float(sigma), float(sigma))
+         sigma_tuple = (float(sigma), float(sigma))
     else:
-        sigma_tuple = sigma
+         sigma_tuple = sigma
 
-    sigma_tuple = tuple(max(0.1, s) for s in sigma_tuple)
-    smoothed = TF.gaussian_blur(x_float, kernel_size=list(kernel_size_tuple), sigma=list(sigma_tuple))
-    
-    blending_weights = torch.sigmoid(noise_profile_float)
-    blending_weights = blending_weights.repeat(1, x_float.size(1), 1, 1)
-    
+    # Ensure sigma values are positive to avoid issues
+    sigma_tuple = tuple(max(0.1, s) for s in sigma_tuple) # Add small epsilon
+
+    smoothed = TF.gaussian_blur(x_float, kernel_size=kernel_size_tuple, sigma=sigma_tuple)
+
+    # Bước 2: Chuẩn hóa noise_profile (sigmoid) và mở rộng cho đúng số kênh
+    # Sigmoid ensures blending weights are between 0 and 1
+    # A higher noise_profile value should lead to *more* smoothing.
+    # So, blending_weights = noise_profile (after sigmoid)
+    blending_weights = torch.sigmoid(noise_profile_float) # [B, 1, H, W]
+
+    # Expand blending_weights to match the number of channels in x
+    blending_weights = blending_weights.repeat(1, x_float.size(1), 1, 1) # [B, C, H, W]
+
+    # Ensure dimensions match for blending
+    assert blending_weights.shape == x_float.shape, f"Blending weights shape {blending_weights.shape} does not match input shape {x_float.shape}"
+
+    # Bước 3: Trộn ảnh gốc và ảnh đã làm mịn
+    # Output = (1 - alpha) * Original + alpha * Smoothed
+    # where alpha = blending_weights
     weighted_sum = x_float * (1 - blending_weights) + smoothed * blending_weights
+
     return weighted_sum
 
-# --- Optimized Quantum Noise Injection ---
-def optimized_quantum_noise_injection(features, noise_factor=0.05, skip=False):  # Reduced default
-    if skip or noise_factor <= 0:
-        return features.float()
-    
+def quantum_noise_injection(features):
     features_float = features.float()
+
     if features_float.dim() < 4 or features_float.size(2) < 2 or features_float.size(3) < 2:
-        return features_float
+        print("Warning: Features too small for quantum noise injection.")
+        return features_float # Return original features as float
 
     try:
+        # Ensure tensors are on the correct device
         device = features_float.device
-        # Simplified quantum noise - single rotation
-        rotated = torch.rot90(features_float, k=1, dims=[-2, -1])
-        pauli_effect = (features_float + rotated) / 2
-        noise = noise_factor * pauli_effect * torch.randn_like(features_float, device=device)
+        rotated_features = [
+            features_float,
+            torch.rot90(features_float, k=1, dims=[-2, -1]),
+            torch.rot90(features_float, k=2, dims=[-2, -1])
+        ]
+        pauli_effect = torch.mean(torch.stack(rotated_features, dim=0), dim=0)
+        noise = 0.1 * pauli_effect * torch.randn_like(features_float, device=device)
         return features_float + noise
     except RuntimeError as e:
-        print(f"Quantum noise injection failed: {e}")
+        print(f"Quantum noise injection failed: {e}. Returning original features.")
+        # Return original features as float if error occurs
         return features_float
-
-# --- Optimized Encoder Block ---
-class OptimizedEncoderBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, use_noise_processing=True):
+    
+# --- Model Components (U-Net based) ---
+class EncoderBlock(nn.Module):
+    def __init__(self, in_channels, out_channels):
         super().__init__()
-        self.use_noise_processing = use_noise_processing
         self.conv_block1 = BasicConvBlock(in_channels, out_channels)
         self.conv_block2 = BasicConvBlock(out_channels, out_channels)
-        
-        if use_noise_processing:
-            self.noise_estimator = ePURE(in_channels=in_channels)
-        else:
-            self.noise_estimator = None
+        self.noise_estimator = ePURE(in_channels=in_channels)
 
     def forward(self, x):
-        if x.dim() == 4 and x.shape[3] == 1:
-            x = x.permute(0, 3, 1, 2)
-
-        if self.noise_estimator is not None:
-            noise_profile = self.noise_estimator(x)
-            x_smoothed = adaptive_spline_smoothing(x, noise_profile)
-            x = self.conv_block1(x_smoothed)
-        else:
-            x = self.conv_block1(x)
-        
+        noise_profile = self.noise_estimator(x)
+        x_smoothed = adaptive_spline_smoothing(x, noise_profile)
+        x = self.conv_block1(x_smoothed)
         x = self.conv_block2(x)
         return x
-
-# --- Optimized Maxwell Solver ---
+    
 class MaxwellSolver(nn.Module):
-    def __init__(self, in_channels, hidden_dim=24):  # Reduced from 32
+    def __init__(self, in_channels, hidden_dim=32):
         super(MaxwellSolver, self).__init__()
         self.encoder = nn.Sequential(
-            nn.Conv2d(in_channels, hidden_dim, kernel_size=3, padding=1), 
-            nn.ReLU(),
-            nn.Conv2d(hidden_dim, 2, kernel_size=3, padding=1)
-        )
+            nn.Conv2d(in_channels, hidden_dim, kernel_size=3, padding=1), nn.ReLU(),
+            nn.Conv2d(hidden_dim, 2, kernel_size=3, padding=1))
         omega, mu_0, eps_0 = 2 * np.pi * 42.58e6, 4 * np.pi * 1e-7, 8.854187817e-12
         self.k0 = torch.tensor(omega * np.sqrt(mu_0 * eps_0), dtype=torch.float32)
 
     def forward(self, x):
-        if x.dim() == 4 and x.shape[3] == 1:
-            x = x.permute(0, 3, 1, 2)
         eps_sigma_map = self.encoder(x)
         return eps_sigma_map[:, 0:1, :, :], eps_sigma_map[:, 1:2, :, :]
 
@@ -221,472 +194,362 @@ class MaxwellSolver(nn.Module):
 
     def _laplacian_2d(self, x_complex):
         k = torch.tensor([[0.,1.,0.],[1.,-4.,1.],[0.,1.,0.]], device=x_complex.device).reshape(1,1,3,3)
+        # Handle cases where real or imag part might have 0 channels if x_complex is purely real/imag
         groups_real = x_complex.real.size(1) if x_complex.real.size(1) > 0 else 1
         groups_imag = x_complex.imag.size(1) if x_complex.imag.size(1) > 0 else 1
+
         real_lap = F.conv2d(x_complex.real, k.repeat(groups_real,1,1,1) if groups_real > 0 else k, padding=1, groups=groups_real)
         imag_lap = F.conv2d(x_complex.imag, k.repeat(groups_imag,1,1,1) if groups_imag > 0 else k, padding=1, groups=groups_imag)
         return torch.complex(real_lap, imag_lap)
-
-# --- Optimized Decoder Block ---
-class OptimizedDecoderBlock(nn.Module):
-    def __init__(self, in_channels, skip_channels, out_channels, use_maxwell=False):
+    
+class DecoderBlock(nn.Module):
+    def __init__(self, in_channels, skip_channels, out_channels):
         super().__init__()
         self.up = nn.ConvTranspose2d(in_channels, in_channels // 2, kernel_size=2, stride=2)
         concat_ch = in_channels // 2 + skip_channels
-        self.use_maxwell = use_maxwell
-        
-        if use_maxwell:
-            self.maxwell_solver = MaxwellSolver(concat_ch)
-        else:
-            self.maxwell_solver = None
-            
+        self.maxwell_solver = MaxwellSolver(concat_ch)
         self.conv_block1 = BasicConvBlock(concat_ch, out_channels)
         self.conv_block2 = BasicConvBlock(out_channels, out_channels)
 
     def forward(self, x, skip_connection):
-        if x.dim() == 4 and x.shape[3] == 1:
-            x = x.permute(0, 3, 1, 2)
-        if skip_connection.dim() == 4 and skip_connection.shape[3] == 1:
-            skip_connection = skip_connection.permute(0, 3, 1, 2)
-
         x = self.up(x)
         diffY, diffX = skip_connection.size()[2]-x.size()[2], skip_connection.size()[3]-x.size()[3]
         x = F.pad(x, [diffX//2, diffX-diffX//2, diffY//2, diffY-diffY//2])
         x_cat = torch.cat([skip_connection, x], dim=1)
-        
-        es_tuple = self.maxwell_solver(x_cat) if self.use_maxwell and self.maxwell_solver is not None else (None, None)
-        
+        es_tuple = self.maxwell_solver(x_cat)
         out = self.conv_block1(x_cat)
         out = self.conv_block2(out)
         return out, es_tuple
-
-# --- Optimized Main Model ---
-class OptimizedRobustMedVFL_UNet(nn.Module):
-    def __init__(self, n_channels=1, n_classes=4, dropout_rate=0.1, pruning_config=None):
+    
+class RobustMedVFL_UNet(nn.Module):
+    def __init__(self, n_channels=1, n_classes=4):
         super().__init__()
-        
-        # Default optimized pruning configuration
-        if pruning_config is None:
-            pruning_config = {
-                'noise_processing_levels': [0, 1],  # Only first 2 encoder levels
-                'maxwell_solver_levels': [0, 1],    # Only first 2 decoder levels
-                'dropout_positions': [0],           # Only one dropout position
-                'skip_quantum_noise': False
-            }
-        
-        self.pruning_config = pruning_config
-        
-        # Optimized encoder path
-        self.enc1 = OptimizedEncoderBlock(
-            n_channels, 64, 
-            use_noise_processing=(0 in pruning_config['noise_processing_levels'])
-        )
-        self.pool1 = nn.MaxPool2d(2)
-        
-        self.enc2 = OptimizedEncoderBlock(
-            64, 128,
-            use_noise_processing=(1 in pruning_config['noise_processing_levels'])
-        )
-        self.pool2 = nn.MaxPool2d(2)
-        
-        self.enc3 = OptimizedEncoderBlock(
-            128, 256,
-            use_noise_processing=(2 in pruning_config['noise_processing_levels'])
-        )
-        self.pool3 = nn.MaxPool2d(2)
-        
-        self.enc4 = OptimizedEncoderBlock(
-            256, 512,
-            use_noise_processing=(3 in pruning_config['noise_processing_levels'])
-        )
-        self.pool4 = nn.MaxPool2d(2)
-        
-        # Bottleneck - always keep noise processing
-        self.bottleneck = OptimizedEncoderBlock(512, 1024, use_noise_processing=True)
-        
-        # Selective dropout
-        self.dropout = nn.Dropout2d(p=dropout_rate) if 0 in pruning_config['dropout_positions'] else nn.Identity()
-        
-        # Optimized decoder path
-        self.dec1 = OptimizedDecoderBlock(
-            1024, 512, 512,
-            use_maxwell=(0 in pruning_config['maxwell_solver_levels'])
-        )
-        self.dec2 = OptimizedDecoderBlock(
-            512, 256, 256,
-            use_maxwell=(1 in pruning_config['maxwell_solver_levels'])
-        )
-        self.dec3 = OptimizedDecoderBlock(
-            256, 128, 128,
-            use_maxwell=(2 in pruning_config['maxwell_solver_levels'])
-        )
-        self.dec4 = OptimizedDecoderBlock(
-            128, 64, 64,
-            use_maxwell=(3 in pruning_config['maxwell_solver_levels'])
-        )
-        
-        # Output conv
+        self.enc1, self.pool1 = EncoderBlock(n_channels, 64), nn.MaxPool2d(2)
+        self.enc2, self.pool2 = EncoderBlock(64, 128), nn.MaxPool2d(2)
+        self.enc3, self.pool3 = EncoderBlock(128, 256), nn.MaxPool2d(2)
+        self.enc4, self.pool4 = EncoderBlock(256, 512), nn.MaxPool2d(2)
+        self.bottleneck = EncoderBlock(512, 1024)
+        self.dec1 = DecoderBlock(1024, 512, 512)
+        self.dec2 = DecoderBlock(512, 256, 256)
+        self.dec3 = DecoderBlock(256, 128, 128)
+        self.dec4 = DecoderBlock(128, 64, 64)
         self.out_conv = nn.Conv2d(64, n_classes, kernel_size=1)
 
     def forward(self, x):
-        # Input format handling
-        if x.dim() == 4 and x.shape[3] == 1:
-            x = x.permute(0, 3, 1, 2)
-        
-        # Encoder path
-        e1 = self.enc1(x)
-        p1 = self.pool1(e1)
-        
-        e2 = self.enc2(p1)
-        p2 = self.pool2(e2)
-        
-        e3 = self.enc3(p2)
-        p3 = self.pool3(e3)
-        
-        e4 = self.enc4(p3)
-        p4 = self.pool4(e4)
-        
-        # Bottleneck
-        b = self.bottleneck(p4)
-        b = self.dropout(b)
-        
-        # Decoder path
-        d1, es1 = self.dec1(b, e4)
-        d2, es2 = self.dec2(d1, e3)
-        d3, es3 = self.dec3(d2, e2)
-        d4, es4 = self.dec4(d3, e1)
-        
-        # Filter valid es_tuples
-        valid_es_tuples = [es for es in [es1, es2, es3, es4] if es[0] is not None]
-        
-        return self.out_conv(d4), valid_es_tuples
-
-# --- Optimized Loss Functions ---
-class WeightedDiceLoss(nn.Module):
-    def __init__(self, num_classes=4, smooth=1e-6, class_weights=None):
-        super().__init__()
-        self.num_classes = num_classes
-        self.smooth = smooth
-        self.class_weights = class_weights
-        if self.class_weights is not None:
-            self.class_weights = torch.tensor(class_weights, dtype=torch.float32)
-
+        e1=self.enc1(x); p1=self.pool1(e1); e2=self.enc2(p1); p2=self.pool2(e2)
+        e3=self.enc3(p2); p3=self.pool3(e3); e4=self.enc4(p3); p4=self.pool4(e4)
+        b=self.bottleneck(p4)
+        d1,es1=self.dec1(b,e4); d2,es2=self.dec2(d1,e3)
+        d3,es3=self.dec3(d2,e2); d4,es4=self.dec4(d3,e1)
+        return self.out_conv(d4), (es1, es2, es3, es4)
+    
+# --- Loss Functions ---
+class DiceLoss(nn.Module):
+    def __init__(self, num_classes=4, smooth=1e-6): # Đã dùng num_classes
+        super().__init__(); self.num_classes, self.smooth = num_classes, smooth
     def forward(self, inputs, targets):
-        inputs = F.softmax(inputs, dim=1)
-        loss = 0
+        inputs = F.softmax(inputs, dim=1); loss = 0
         for i in range(self.num_classes):
-            inp_c = inputs[:, i, :, :].contiguous().view(-1)
-            tgt_c = (targets == i).float().contiguous().view(-1)
+            inp_c = inputs[:,i,:,:].contiguous().view(-1)
+            tgt_c = (targets==i).float().contiguous().view(-1)
             inter = (inp_c * tgt_c).sum()
-            dice = (2. * inter + self.smooth) / (inp_c.sum() + tgt_c.sum() + self.smooth)
-            
-            if self.class_weights is not None:
-                weight = self.class_weights[i].to(inputs.device)
-                loss += weight * (1 - dice)
-            else:
-                loss += (1 - dice)
+            dice = (2.*inter+self.smooth)/(inp_c.sum()+tgt_c.sum()+self.smooth)
+            loss += (1-dice)
         return loss / self.num_classes
-
-class FocalLoss(nn.Module):
-    def __init__(self, alpha=1, gamma=2, class_weights=None, num_classes=4):
-        super().__init__()
-        self.alpha = alpha
-        self.gamma = gamma
-        self.class_weights = class_weights
-        if self.class_weights is not None:
-            self.class_weights = torch.tensor(class_weights, dtype=torch.float32)
-
-    def forward(self, inputs, targets):
-        device_weights = None
-        if self.class_weights is not None:
-            device_weights = self.class_weights.to(inputs.device)
-        ce_loss = F.cross_entropy(inputs, targets, weight=device_weights, reduction='none')
-        pt = torch.exp(-ce_loss)
-        focal_loss = self.alpha * (1 - pt) ** self.gamma * ce_loss
-        return focal_loss.mean()
 
 class PhysicsLoss(nn.Module):
     def __init__(self, in_channels_solver):
-        super().__init__()
-        self.ms = MaxwellSolver(in_channels_solver)
-
+        super().__init__(); self.ms = MaxwellSolver(in_channels_solver)
     def forward(self, b1, eps, sig):
-        b, e, s = b1.to(DEVICE), eps.to(DEVICE), sig.to(DEVICE)
-        return torch.mean(self.ms.compute_helmholtz_residual(b, e, s))
+        b,e,s = b1.to(DEVICE), eps.to(DEVICE), sig.to(DEVICE)
+        return torch.mean(self.ms.compute_helmholtz_residual(b,e,s))
 
 class SmoothnessLoss(nn.Module):
-    def __init__(self):
-        super().__init__()
-
+    def __init__(self): super().__init__()
     def forward(self, x):
-        dy = torch.abs(x[:,:,1:,:] - x[:,:,:-1,:])
-        dx = torch.abs(x[:,:,:,1:] - x[:,:,:,:-1])
+        dy = torch.abs(x[:,:,1:,:]-x[:,:,:-1,:]); dx = torch.abs(x[:,:,:,1:]-x[:,:,:,:-1])
         return torch.mean(dy) + torch.mean(dx)
 
-# --- Optimized Combined Loss ---
-class OptimizedCombinedLoss(nn.Module):
-    def __init__(self, wc=0.4, wd=0.4, wf=0.2, wp=0.05, ws=0.01, 
-                 num_classes=4, class_weights=None):
+class CombinedLoss(nn.Module):
+    # SỬA Ở ĐÂY: đổi 'nc' thành 'num_classes'
+    def __init__(self, wc=.5, wd=.5, wp=.1, ws=.01, in_channels_maxwell=1024, num_classes=4):
         super().__init__()
-        # Reduced physics weight since fewer Maxwell solvers
-        self.wc, self.wd, self.wf, self.wp, self.ws = wc, wd, wf, wp, ws
-        
-        self.ce = nn.CrossEntropyLoss(
-            weight=torch.tensor(class_weights, dtype=torch.float32) if class_weights else None
-        )
-        self.dl = WeightedDiceLoss(num_classes=num_classes, class_weights=class_weights)
-        self.fl = FocalLoss(class_weights=class_weights, num_classes=num_classes)
-        self.pl = PhysicsLoss(in_channels_solver=1024)
+        self.ce = nn.CrossEntropyLoss()
+        self.dl = DiceLoss(num_classes=num_classes) # Khởi tạo DiceLoss với num_classes
+        self.pl = PhysicsLoss(in_channels_solver=in_channels_maxwell) # Đổi tên cho rõ nghĩa
         self.sl = SmoothnessLoss()
+        self.wc,self.wd,self.wp,self.ws = wc,wd,wp,ws
+        # self.num_classes = num_classes # Có thể lưu lại nếu cần dùng ở đâu khác trong CombinedLoss
 
     def forward(self, logits, targets, b1, all_es, feat_sm=None):
-        # Core losses
-        lce = self.ce(logits, targets.long())
-        ldc = self.dl(logits, targets.long())
-        lfl = self.fl(logits, targets.long())
+        lce = self.ce(logits,targets.long())
+        ldc = self.dl(logits,targets.long()) # DiceLoss đã có num_classes từ __init__
+        loss = self.wc*lce + self.wd*ldc
         
-        loss = self.wc * lce + self.wd * ldc + self.wf * lfl
-        
-        # Physics loss - only if valid es_tuples exist
-        lphy = torch.tensor(0., device=logits.device)
-        if b1 is not None and all_es and len(all_es) > 0:
-            e1, s1 = all_es[0]
-            if e1 is not None and s1 is not None:
-                lphy = self.pl(b1, e1, s1)
-                loss += self.wp * lphy
-        
-        # Smoothness loss
-        lsm = torch.tensor(0., device=logits.device)
+        lphy = torch.tensor(0.,device=logits.device)
+        if b1 is not None and all_es and len(all_es)>0:
+            # Giả sử all_es[0] là tuple (eps, sigma) từ tầng decoder quan trọng nhất
+            e1,s1 = all_es[0] 
+            lphy=self.pl(b1,e1,s1)
+            loss+=self.wp*lphy
+            
+        lsm = torch.tensor(0.,device=logits.device)
         if feat_sm is not None:
-            lsm = self.sl(feat_sm)
-            loss += self.ws * lsm
-        
+            lsm=self.sl(feat_sm)
+            loss+=self.ws*lsm
         return loss
+    
+# # --- Data Loading ---
+# def load_h5_data(directory, is_training=True, target_size=(256,256), max_samples=None):
+#     imgs,msks,count = [],[],0
+#     if not os.path.exists(directory): return np.array([]), (np.array([]) if is_training else None)
+#     for fname in sorted(os.listdir(directory)):
+#         if max_samples and count>=max_samples: break
+#         if fname.endswith('.h5'):
+#             try:
+#                 with h5py.File(os.path.join(directory,fname),'r') as f:
+#                     img_d, msk_d = f['image'][:], (f['label'][:] if is_training else None)
+#                     proc = lambda d,t_sz,is_m: resize(d.astype(np.uint8 if is_m else np.float32),t_sz,order=(0 if is_m else 1),preserve_range=True,anti_aliasing=(not is_m),mode='reflect').astype(np.uint8 if is_m else np.float32)
+#                     if img_d.ndim==3:
+#                         for i in range(img_d.shape[0]):
+#                             imgs.append(np.expand_dims(proc(img_d[i],target_size,False),axis=-1))
+#                             if is_training: msks.append(proc(msk_d[i],target_size,True))
+#                     elif img_d.ndim==2:
+#                         imgs.append(np.expand_dims(proc(img_d,target_size,False),axis=-1))
+#                         if is_training: msks.append(proc(msk_d,target_size,True))
+#                 count+=1
+#             except Exception as e: print(f"Err load {fname}: {e}")
+#     im_np = np.array(imgs,dtype=np.float32) if imgs else np.empty((0,target_size[0],target_size[1],1),dtype=np.float32)
+#     msk_np = np.array(msks,dtype=np.uint8) if is_training and msks else (np.empty((0,target_size[0],target_size[1]),dtype=np.uint8) if is_training else None)
+#     return im_np, msk_np
 
-# --- Utility Functions ---
-# Metrics functions moved to src/utils/metrics.py
+def load_h5_data(directory, is_training=True, target_size=(256,256), max_samples=None):
+    imgs, msks, count = [], [], 0
+    if not os.path.exists(directory):
+        return np.array([]), (np.array([]) if is_training else None)
 
-# --- Main Execution ---
+    for fname in sorted(os.listdir(directory)):
+        if max_samples and count >= max_samples:
+            break
+        if fname.endswith('.h5'):
+            try:
+                with h5py.File(os.path.join(directory, fname), 'r') as f:
+                    img_d = f['image'][:]
+                    msk_d = f['label'][:] if 'label' in f else None  # <- luôn cố load label nếu có
+
+                    proc = lambda d, t_sz, is_m: resize(
+                        d.astype(np.uint8 if is_m else np.float32), t_sz,
+                        order=(0 if is_m else 1), preserve_range=True,
+                        anti_aliasing=(not is_m), mode='reflect'
+                    ).astype(np.uint8 if is_m else np.float32)
+
+                    if img_d.ndim == 3:
+                        for i in range(img_d.shape[0]):
+                            imgs.append(np.expand_dims(proc(img_d[i], target_size, False), axis=-1))
+                            if msk_d is not None:
+                                msks.append(proc(msk_d[i], target_size, True))
+                    elif img_d.ndim == 2:
+                        imgs.append(np.expand_dims(proc(img_d, target_size, False), axis=-1))
+                        if msk_d is not None:
+                            msks.append(proc(msk_d, target_size, True))
+                count += 1
+            except Exception as e:
+                print(f"Err load {fname}: {e}")
+
+    im_np = np.array(imgs, dtype=np.float32) if imgs else np.empty((0, target_size[0], target_size[1], 1), dtype=np.float32)
+    msk_np = np.array(msks, dtype=np.uint8) if msks else None  # <- đơn giản hóa
+    return im_np, msk_np
+
+# --- Metrics ---
+def evaluate_metrics(model, dataloader, device, num_classes=4):
+    model.eval()
+    tp = [0] * num_classes
+    fp = [0] * num_classes
+    fn = [0] * num_classes
+    dice_s = [0.0] * num_classes
+    iou_s = [0.0] * num_classes
+    batches = 0
+
+    with torch.no_grad():
+        for imgs,tgts in dataloader:
+            imgs,tgts = imgs.to(device),tgts.to(device)
+            if imgs.size(0) == 0: continue
+            logits,_ = model(imgs)
+            preds = torch.argmax(F.softmax(logits,dim=1),dim=1); batches+=1
+            for c in range(num_classes):
+                pc_f,tc_f=(preds==c).float().view(-1),(tgts==c).float().view(-1); inter=(pc_f*tc_f).sum()
+                dice_s[c]+=((2.*inter+1e-6)/(pc_f.sum()+tc_f.sum()+1e-6)).item()
+                iou_s[c]+=((inter+1e-6)/(pc_f.sum()+tc_f.sum()-inter+1e-6)).item()
+                tp[c]+=inter.item(); fp[c]+=(pc_f.sum()-inter).item(); fn[c]+=(tc_f.sum()-inter).item()
+    metrics={'dice_scores':[],'iou':[],'precision':[],'recall':[],'f1_score':[]}
+    if batches>0:
+        for c in range(num_classes):
+            metrics['dice_scores'].append(dice_s[c]/batches); metrics['iou'].append(iou_s[c]/batches)
+            prec,rec = tp[c]/(tp[c]+fp[c]+1e-6), tp[c]/(tp[c]+fn[c]+1e-6)
+            metrics['precision'].append(prec); metrics['recall'].append(rec)
+            metrics['f1_score'].append(2*prec*rec/(prec+rec+1e-6) if (prec+rec > 0) else 0.0)
+    else: 
+        for _ in range(num_classes): [metrics[key].append(0.0) for key in metrics]
+    return metrics
+
+# --- Main Execution (Centralized Training) ---
 if __name__ == "__main__":
     print(f"Device: {DEVICE}")
     
-    # Initialize medical image preprocessor
-    preprocessor = MedicalImagePreprocessor(
-        target_size=(IMG_SIZE, IMG_SIZE),
-        normalize=True
-    )
-
-    # Data paths
-    base_data_path_h5 = '/Users/alvinluong/Documents/ACDC_preprocessed'
-    base_data_path_nifti = '/Users/alvinluong/Documents/Federated_Learning/ACDC/database'
-
-    # Initialize variables
-    X_train_tensor = None
-    y_train_tensor = None
-    X_val_tensor = None
-    y_val_tensor = None
-    X_test_tensor = None
-    y_test_tensor = None
-    test_dataloader = None
-    class_weights = None
-
-    # Load data (same as original but with optimized processing)
-    if os.path.exists(base_data_path_nifti) and os.listdir(base_data_path_nifti):
-        print(f"Using NIfTI data from {base_data_path_nifti}")
-        train_dir = os.path.join(base_data_path_nifti, 'training')
-        test_dir = os.path.join(base_data_path_nifti, 'testing')
-
-        # Create ACDC dataset for training
-        train_dataset = ACDCDataset(
-            data_dir=train_dir,
-            preprocessor=preprocessor,
-            num_classes=NUM_CLASSES
-        )
+    # --- Load Data ---
+    base_data_path = '/kaggle/input/acdc-dataset/ACDC_preprocessed'
+    if not os.path.exists(base_data_path) or not os.listdir(base_data_path):
+        print(f"Path '{base_data_path}' not found/empty. Using DUMMY data.")
+        # Tạo dữ liệu dummy để code chạy được
+        X_train_tensor = torch.randn(100, 1, IMG_SIZE, IMG_SIZE) # 100 mẫu huấn luyện
+        y_train_tensor = torch.randint(0, NUM_CLASSES, (100, IMG_SIZE, IMG_SIZE))
+        X_val_tensor = torch.randn(20, 1, IMG_SIZE, IMG_SIZE) # 20 mẫu validation
+        y_val_tensor = torch.randint(0, NUM_CLASSES, (20, IMG_SIZE, IMG_SIZE))
+    else:
+        train_dir = os.path.join(base_data_path, 'ACDC_training_slices')
+        test_dir = os.path.join(base_data_path, 'ACDC_testing_volumes') # Nếu cần test set riêng
         
-        # Create ACDC dataset for testing
-        test_dataset = ACDCDataset(
-            data_dir=test_dir,
-            preprocessor=preprocessor,
-            num_classes=NUM_CLASSES
-        )
+        # Tải toàn bộ dữ liệu huấn luyện
+        all_train_images_np, all_train_masks_np = load_h5_data(train_dir, is_training=True, target_size=(IMG_SIZE, IMG_SIZE), max_samples=600) # Giảm max_samples cho nhanh
+        all_test_images_np, all_test_masks_np = load_h5_data(test_dir, is_training=False, target_size=(IMG_SIZE, IMG_SIZE), max_samples=200)
         
-        # Extract data from datasets for compatibility with existing code
-        all_train_images_np = []
-        all_train_masks_np = []
-        for i in range(min(600, len(train_dataset))):
-            img, mask = train_dataset[i]
-            all_train_images_np.append(img.squeeze().numpy())
-            all_train_masks_np.append(mask.numpy())
-        
-        all_test_images_np = []
-        all_test_masks_np = []
-        for i in range(min(200, len(test_dataset))):
-            img, mask = test_dataset[i]
-            all_test_images_np.append(img.squeeze().numpy())
-            all_test_masks_np.append(mask.numpy())
-        
-        # Convert to numpy arrays
-        all_train_images_np = np.array(all_train_images_np)
-        all_train_masks_np = np.array(all_train_masks_np)
-        all_test_images_np = np.array(all_test_images_np)
-        all_test_masks_np = np.array(all_test_masks_np)
-
         if all_train_images_np.size == 0:
-            raise ValueError("Training data is empty after loading.")
+            raise ValueError("Training data is empty after loading. Check data path and content.")
+        
+        # Normalize
+        if np.max(all_train_images_np) > 0:
+            all_train_images_np = all_train_images_np / np.max(all_train_images_np)
 
-        class_weights = compute_class_weights(all_train_masks_np, NUM_CLASSES) if all_train_masks_np is not None else None
-
-        if all_test_images_np.size > 0:
-            X_test_tensor = torch.tensor(all_test_images_np).permute(0, 3, 1, 2).float()
-            if all_test_masks_np is not None:
-                y_test_tensor = torch.tensor(all_test_masks_np).long()
-                test_dataset = TensorDataset(X_test_tensor, y_test_tensor)
-                test_dataloader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=2)
-            else:
-                y_test_tensor = None
-                test_dataloader = None
-
+        if np.max(all_test_images_np) > 0:
+            all_test_images_np = all_test_images_np / np.max(all_test_images_np)
+        
+        X_test_tensor = torch.tensor(all_test_images_np).permute(0, 3, 1, 2).float()
+        y_test_tensor = torch.tensor(all_test_masks_np).long()
+        
+        test_dataset = TensorDataset(X_test_tensor, y_test_tensor)
+        test_dataloader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=2, pin_memory=True if DEVICE.type == 'cuda' else False)
+        
+        # Chia train/validation từ toàn bộ dữ liệu đã tải
         X_train_np, X_val_np, y_train_np, y_val_np = train_test_split(
-            all_train_images_np, all_train_masks_np, test_size=0.2, random_state=42
+            all_train_images_np, all_train_masks_np, test_size=0.2, random_state=42 # 20% cho validation
         )
-
+        
         X_train_tensor = torch.tensor(X_train_np).permute(0, 3, 1, 2).float()
         y_train_tensor = torch.tensor(y_train_np).long()
         X_val_tensor = torch.tensor(X_val_np).permute(0, 3, 1, 2).float()
         y_val_tensor = torch.tensor(y_val_np).long()
 
-    elif os.path.exists(base_data_path_h5) and os.listdir(base_data_path_h5):
-        # Similar processing for H5 data
-        print(f"Using preprocessed H5 data from {base_data_path_h5}")
-        # ... (same logic as NIfTI)
-    else:
-        print("No data found. Using DUMMY data.")
-        X_train_tensor = torch.randn(100, 1, IMG_SIZE, IMG_SIZE)
-        y_train_tensor = torch.randint(0, NUM_CLASSES, (100, IMG_SIZE, IMG_SIZE))
-        X_val_tensor = torch.randn(20, 1, IMG_SIZE, IMG_SIZE)
-        y_val_tensor = torch.randint(0, NUM_CLASSES, (20, IMG_SIZE, IMG_SIZE))
-        X_test_tensor = torch.randn(10, 1, IMG_SIZE, IMG_SIZE)
-        y_test_tensor = torch.randint(0, NUM_CLASSES, (10, IMG_SIZE, IMG_SIZE))
-        test_dataset = TensorDataset(X_test_tensor, y_test_tensor)
-        test_dataloader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
-        class_weights = None
+    if len(X_train_tensor) == 0: raise ValueError("No training samples after split.")
+    if len(X_val_tensor) == 0: print("Warning: Validation set is empty after split.")
 
-    # Create datasets and dataloaders
-    if X_train_tensor is not None and y_train_tensor is not None:
-        train_dataset = TensorDataset(X_train_tensor, y_train_tensor)
-        train_dataloader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=2)
-    else:
-        train_dataset = None
-        train_dataloader = None
+    train_dataset = TensorDataset(X_train_tensor, y_train_tensor)
+    val_dataset = TensorDataset(X_val_tensor, y_val_tensor)
+
+    train_dataloader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=2, pin_memory=True if DEVICE.type == 'cuda' else False)
+    val_dataloader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=2, pin_memory=True if DEVICE.type == 'cuda' else False)
     
-    if X_val_tensor is not None and y_val_tensor is not None:
-        val_dataset = TensorDataset(X_val_tensor, y_val_tensor)
-        val_dataloader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=2)
-    else:
-        val_dataset = None
-        val_dataloader = None
+    print(f"Training samples: {len(train_dataset)}, Validation samples: {len(val_dataset)}")
+    print("Data loaded and prepared for centralized training.")
 
-    train_size = len(train_dataset) if train_dataset is not None else 0
-    val_size = len(val_dataset) if val_dataset is not None else 0
-    print(f"Training samples: {train_size}, Validation samples: {val_size}")
-    print("Data loaded and prepared for optimized centralized training.")
-
-    # Initialize optimized model with balanced pruning config
-    balanced_config = {
-        'noise_processing_levels': [0, 1],
-        'maxwell_solver_levels': [0, 1],
-        'dropout_positions': [0],
-        'skip_quantum_noise': False
-    }
-
-    model = OptimizedRobustMedVFL_UNet(
-        n_channels=1, 
-        n_classes=NUM_CLASSES, 
-        pruning_config=balanced_config
-    ).to(DEVICE)
-
-    criterion = OptimizedCombinedLoss(
-        num_classes=NUM_CLASSES, 
-        class_weights=class_weights
-    ).to(DEVICE)
-
+    # --- Initialize Model, Criterion, Optimizer ---
+    model = RobustMedVFL_UNet(n_channels=1, n_classes=NUM_CLASSES).to(DEVICE)
+    criterion = CombinedLoss(num_classes=NUM_CLASSES, in_channels_maxwell=1024).to(DEVICE)
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    # scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=5, factor=0.5) # Tùy chọn
 
-    # Training loop
-    best_val_metric = 0.0
+    # --- Centralized Training Loop ---
+    best_val_metric = 0.0 # Hoặc float('inf') nếu loss là metric chính
+
     for epoch in range(NUM_EPOCHS_CENTRALIZED):
         print(f"\n--- Epoch {epoch + 1}/{NUM_EPOCHS_CENTRALIZED} ---")
-
+        
         # Training phase
         model.train()
         epoch_train_loss = 0.0
         num_train_batches = 0
-
-        if train_dataloader is None:
-            print("No training data available. Skipping training.")
-            break
-            
+        
         for images, targets in train_dataloader:
             images, targets = images.to(DEVICE), targets.to(DEVICE)
             
-            # Apply optimized quantum noise injection
-            if not balanced_config['skip_quantum_noise']:
-                images_noisy = optimized_quantum_noise_injection(images, noise_factor=0.05)
-            else:
-                images_noisy = images
-
+            images_noisy = quantum_noise_injection(images) # Tùy chọn áp dụng noise
+            
             optimizer.zero_grad()
             logits, all_eps_sigma_tuples = model(images_noisy)
-            b1_map_placeholder = torch.randn_like(images[:, 0:1, ...], device=DEVICE)
-            loss = criterion(logits, targets, b1_map_placeholder, all_eps_sigma_tuples)
-
+            b1_map_placeholder = torch.randn_like(images[:, 0:1, ...], device=DEVICE) # Placeholder
+            
+            loss = criterion(logits, targets, b1_map_placeholder, all_eps_sigma_tuples) #, features_for_smoothness=None)
+            
             loss.backward()
             optimizer.step()
-
+            
             epoch_train_loss += loss.item()
             num_train_batches += 1
-
+        
         avg_train_loss = epoch_train_loss / num_train_batches if num_train_batches > 0 else 0
-        print(f" Epoch {epoch+1} - Training Loss: {avg_train_loss:.4f}")
-
+        print(f"  Epoch {epoch+1} - Training Loss: {avg_train_loss:.4f}")
+        
         # Validation phase
-        try:
-            if val_dataloader is not None:
-                print(" Evaluating on validation set...")
-                val_metrics = evaluate_metrics(model, val_dataloader, DEVICE, NUM_CLASSES)
-                
-                fg_dice = val_metrics['dice_scores'][1:] if NUM_CLASSES > 1 else [val_metrics['dice_scores'][0]]
-                avg_fg_dice = np.mean(fg_dice)
-                
-                print(f" Epoch {epoch+1} - Validation Avg Foreground Dice: {avg_fg_dice:.4f}")
-                
-                if avg_fg_dice > best_val_metric:
-                    best_val_metric = avg_fg_dice
-                    print(f" New best validation Dice: {best_val_metric:.4f}")
-                    
-                    # Print detailed metrics for best epoch
-                    if epoch % 10 == 0 or avg_fg_dice > best_val_metric:
-                        class_names = ['Background', 'RV', 'Myocardium', 'LV']
-                        print_metrics_summary(val_metrics, class_names)
-            else:
-                print(" Validation dataset not available.")
-        except Exception as e:
-            print(f"Error during validation: {e}")
-
-    print("\n--- Optimized Centralized Training Finished ---")
-
-    # Test evaluation
-    try:
-        if test_dataloader is not None:
-            print("\n--- Evaluating on Test Set ---")
-            test_metrics = evaluate_metrics(model, test_dataloader, DEVICE, NUM_CLASSES)
-            fg_dice = test_metrics['dice_scores'][1:] if NUM_CLASSES > 1 else [test_metrics['dice_scores'][0]]
-            print(f" Test Avg Foreground Dice: {np.mean(fg_dice):.4f}")
+        if val_dataloader.dataset and len(val_dataloader.dataset) > 0:
+            print("  Evaluating on validation set...")
+            val_metrics = evaluate_metrics(model, val_dataloader, DEVICE, NUM_CLASSES)
+            # Sử dụng Dice score của class foreground trung bình làm metric chính để so sánh
+            # Lấy các giá trị foreground (class từ 1 trở đi)
+            fg_dice = val_metrics['dice_scores'][1:] if NUM_CLASSES > 1 else [val_metrics['dice_scores'][0]]
+            fg_iou = val_metrics['iou'][1:] if NUM_CLASSES > 1 else [val_metrics['iou'][0]]
+            fg_precision = val_metrics['precision'][1:] if NUM_CLASSES > 1 else [val_metrics['precision'][0]]
+            fg_recall = val_metrics['recall'][1:] if NUM_CLASSES > 1 else [val_metrics['recall'][0]]
+            fg_f1 = val_metrics['f1_score'][1:] if NUM_CLASSES > 1 else [val_metrics['f1_score'][0]]
             
-            # Print detailed test metrics
-            class_names = ['Background', 'RV', 'Myocardium', 'LV']
-            print_metrics_summary(test_metrics, class_names)
+            avg_fg_dice = np.mean(fg_dice)
+            avg_fg_iou = np.mean(fg_iou)
+            avg_fg_precision = np.mean(fg_precision)
+            avg_fg_recall = np.mean(fg_recall)
+            avg_fg_f1 = np.mean(fg_f1)
+            
+            print(f"  Epoch {epoch+1} - Validation (Avg Foreground): "
+                  f"Dice: {avg_fg_dice:.4f}; IoU: {avg_fg_iou:.4f}; "
+                  f"Precision: {avg_fg_precision:.4f}; Recall: {avg_fg_recall:.4f}; F1-score: {avg_fg_f1:.4f}")
+            for c_idx in range(NUM_CLASSES):
+                print(f"    Class {c_idx}: Dice: {val_metrics['dice_scores'][c_idx]:.4f}; "
+                      f"IoU: {val_metrics['iou'][c_idx]:.4f}; "
+                      f"Precision: {val_metrics['precision'][c_idx]:.4f}; "
+                      f"Recall: {val_metrics['recall'][c_idx]:.4f}; "
+                      f"F1-score: {val_metrics['f1_score'][c_idx]:.4f}")
+
+            # Tùy chọn: Lưu model tốt nhất dựa trên val_metric
+            if avg_fg_dice > best_val_metric:
+                best_val_metric = avg_fg_dice
+                # torch.save(model.state_dict(), "best_centralized_model.pth")
+                # print(f"    New best model saved with Val Dice: {best_val_metric:.4f}")
+            
+            # if scheduler: scheduler.step(avg_val_loss_or_metric) # Nếu dùng scheduler
         else:
-            print("Test dataset not available.")
-    except Exception as e:
-        print(f"Error during test evaluation: {e}")
+            print("  Validation dataset is empty. Skipping validation.")
+
+    print("\n--- Centralized Training Finished ---")
+
+# --- Evaluate on Test Set ---
+if 'test_dataloader' in locals() and len(test_dataloader.dataset) > 0:
+    print("\n--- Evaluating on Test Set ---")
+    test_metrics = evaluate_metrics(model, test_dataloader, DEVICE, NUM_CLASSES)
+
+    fg_dice = test_metrics['dice_scores'][1:] if NUM_CLASSES > 1 else [test_metrics['dice_scores'][0]]
+    fg_iou = test_metrics['iou'][1:] if NUM_CLASSES > 1 else [test_metrics['iou'][0]]
+    fg_precision = test_metrics['precision'][1:] if NUM_CLASSES > 1 else [test_metrics['precision'][0]]
+    fg_recall = test_metrics['recall'][1:] if NUM_CLASSES > 1 else [test_metrics['recall'][0]]
+    fg_f1 = test_metrics['f1_score'][1:] if NUM_CLASSES > 1 else [test_metrics['f1_score'][0]]
+
+    print(f"  Test (Avg Foreground): "
+          f"Dice: {np.mean(fg_dice):.4f}; IoU: {np.mean(fg_iou):.4f}; "
+          f"Precision: {np.mean(fg_precision):.4f}; Recall: {np.mean(fg_recall):.4f}; "
+          f"F1-score: {np.mean(fg_f1):.4f}")
+    
+    for c_idx in range(NUM_CLASSES):
+        print(f"    Class {c_idx}: "
+              f"Dice: {test_metrics['dice_scores'][c_idx]:.4f}; "
+              f"IoU: {test_metrics['iou'][c_idx]:.4f}; "
+              f"Precision: {test_metrics['precision'][c_idx]:.4f}; "
+              f"Recall: {test_metrics['recall'][c_idx]:.4f}; "
+              f"F1-score: {test_metrics['f1_score'][c_idx]:.4f}")
+else:
+    print("Test dataset not available or empty.")
