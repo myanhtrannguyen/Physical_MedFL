@@ -1,11 +1,3 @@
-"""
-Hello m, t đã cop y hệt file Kaggle xuống, h nó đang conflict khá là nhiều
-t đang fix lại,
-Bây h t cần m xem là tỏng model có phần nào m cần chuẩn hoá không, vì code AI
-cũng ngu vl
-Xem lại giúp bạn nhé
-"""
-
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -38,13 +30,6 @@ class BasicConvBlock(nn.Module):
 
     def forward(self, x):
         return self.block(x)
-
-# # --- Auxiliary Model Components ---
-# class ePUREPlaceholder(nn.Module):
-#     def __init__(self): super().__init__()
-#     def forward(self, x): return torch.zeros_like(x)
-
-# def adaptive_spline_smoothing_placeholder(x, noise_profile): return x
 
 # --- ePURE Implementation (Provided) ---
 class ePURE(nn.Module):
@@ -337,7 +322,6 @@ class SmoothnessLoss(nn.Module):
         return torch.mean(dy) + torch.mean(dx)
 
 class CombinedLoss(nn.Module):
-    # SỬA Ở ĐÂY: đổi 'nc' thành 'num_classes'
     def __init__(self, wc=.5, wd=.5, wp=.1, ws=.01, in_channels_maxwell=1024, num_classes=4):
         super().__init__()
         self.ce = nn.CrossEntropyLoss()
@@ -364,67 +348,156 @@ class CombinedLoss(nn.Module):
             lsm=self.sl(feat_sm)
             loss+=self.ws*lsm
         return loss
-    
-# # --- Data Loading ---
+
 # def load_h5_data(directory, is_training=True, target_size=(256,256), max_samples=None):
-#     imgs,msks,count = [],[],0
-#     if not os.path.exists(directory): return np.array([]), (np.array([]) if is_training else None)
+#     imgs, msks, count = [], [], 0
+#     if not os.path.exists(directory):
+#         return np.array([]), (np.array([]) if is_training else None)
+
 #     for fname in sorted(os.listdir(directory)):
-#         if max_samples and count>=max_samples: break
+#         if max_samples and count >= max_samples:
+#             break
 #         if fname.endswith('.h5'):
 #             try:
-#                 with h5py.File(os.path.join(directory,fname),'r') as f:
-#                     img_d, msk_d = f['image'][:], (f['label'][:] if is_training else None)
-#                     proc = lambda d,t_sz,is_m: resize(d.astype(np.uint8 if is_m else np.float32),t_sz,order=(0 if is_m else 1),preserve_range=True,anti_aliasing=(not is_m),mode='reflect').astype(np.uint8 if is_m else np.float32)
-#                     if img_d.ndim==3:
+#                 with h5py.File(os.path.join(directory, fname), 'r') as f:
+#                     img_d = f['image'][:]
+#                     msk_d = f['label'][:] if 'label' in f else None  # <- luôn cố load label nếu có
+
+#                     proc = lambda d, t_sz, is_m: resize(
+#                         d.astype(np.uint8 if is_m else np.float32), t_sz,
+#                         order=(0 if is_m else 1), preserve_range=True,
+#                         anti_aliasing=(not is_m), mode='reflect'
+#                     ).astype(np.uint8 if is_m else np.float32)
+
+#                     if img_d.ndim == 3:
 #                         for i in range(img_d.shape[0]):
-#                             imgs.append(np.expand_dims(proc(img_d[i],target_size,False),axis=-1))
-#                             if is_training: msks.append(proc(msk_d[i],target_size,True))
-#                     elif img_d.ndim==2:
-#                         imgs.append(np.expand_dims(proc(img_d,target_size,False),axis=-1))
-#                         if is_training: msks.append(proc(msk_d,target_size,True))
-#                 count+=1
-#             except Exception as e: print(f"Err load {fname}: {e}")
-#     im_np = np.array(imgs,dtype=np.float32) if imgs else np.empty((0,target_size[0],target_size[1],1),dtype=np.float32)
-#     msk_np = np.array(msks,dtype=np.uint8) if is_training and msks else (np.empty((0,target_size[0],target_size[1]),dtype=np.uint8) if is_training else None)
+#                             imgs.append(np.expand_dims(proc(img_d[i], target_size, False), axis=-1))
+#                             if msk_d is not None:
+#                                 msks.append(proc(msk_d[i], target_size, True))
+#                     elif img_d.ndim == 2:
+#                         imgs.append(np.expand_dims(proc(img_d, target_size, False), axis=-1))
+#                         if msk_d is not None:
+#                             msks.append(proc(msk_d, target_size, True))
+#                 count += 1
+#             except Exception as e:
+#                 print(f"Err load {fname}: {e}")
+
+#     im_np = np.array(imgs, dtype=np.float32) if imgs else np.empty((0, target_size[0], target_size[1], 1), dtype=np.float32)
+#     msk_np = np.array(msks, dtype=np.uint8) if msks else None  # <- đơn giản hóa
 #     return im_np, msk_np
 
-def load_h5_data(directory, is_training=True, target_size=(256,256), max_samples=None):
-    imgs, msks, count = [], [], 0
-    if not os.path.exists(directory):
-        return np.array([]), (np.array([]) if is_training else None)
+import os
+import nibabel as nib
+import numpy as np
+from skimage.transform import resize
+import pandas as pd
 
-    for fname in sorted(os.listdir(directory)):
-        if max_samples and count >= max_samples:
+def load_acdc_data(base_directory, is_training=True, target_size=(256, 256), max_samples=None):
+    imgs, msks, patient_infos = [], [], []
+    current_samples = 0
+
+    # Determine the data subdirectory (training or testing)
+    data_subdir = 'training' if is_training else 'testing'
+    data_path = os.path.join(base_directory, data_subdir)
+
+    if not os.path.exists(data_path):
+        print(f"Error: Directory '{data_path}' not found. Please ensure the dataset is extracted correctly.")
+        return np.array([]), None, pd.DataFrame()
+
+    # Get list of patient directories
+    patient_dirs = sorted([d for d in os.listdir(data_path) if os.path.isdir(os.path.join(data_path, d)) and d.startswith('patient')])
+
+    for patient_dir_name in patient_dirs:
+        if max_samples and current_samples >= max_samples:
             break
-        if fname.endswith('.h5'):
-            try:
-                with h5py.File(os.path.join(directory, fname), 'r') as f:
-                    img_d = f['image'][:]
-                    msk_d = f['label'][:] if 'label' in f else None  # <- luôn cố load label nếu có
 
-                    proc = lambda d, t_sz, is_m: resize(
-                        d.astype(np.uint8 if is_m else np.float32), t_sz,
-                        order=(0 if is_m else 1), preserve_range=True,
-                        anti_aliasing=(not is_m), mode='reflect'
-                    ).astype(np.uint8 if is_m else np.float32)
+        patient_path = os.path.join(data_path, patient_dir_name)
 
-                    if img_d.ndim == 3:
-                        for i in range(img_d.shape[0]):
-                            imgs.append(np.expand_dims(proc(img_d[i], target_size, False), axis=-1))
-                            if msk_d is not None:
-                                msks.append(proc(msk_d[i], target_size, True))
-                    elif img_d.ndim == 2:
-                        imgs.append(np.expand_dims(proc(img_d, target_size, False), axis=-1))
-                        if msk_d is not None:
-                            msks.append(proc(msk_d, target_size, True))
-                count += 1
-            except Exception as e:
-                print(f"Err load {fname}: {e}")
+        # Load patient information (patient.csv)
+        patient_info_path = os.path.join(patient_path, 'Info.cfg')
+        patient_info_dict = {}
+        if os.path.exists(patient_info_path):
+            with open(patient_info_path, 'r') as f:
+                for line in f:
+                    if ':' in line:
+                        key, value = line.split(':', 1)
+                        patient_info_dict[key.strip()] = value.strip()
+            # Convert relevant info to numerical types
+            patient_info_dict['Weight'] = float(patient_info_dict.get('Weight', np.nan))
+            patient_info_dict['Height'] = float(patient_info_dict.get('Height', np.nan))
+            patient_info_dict['BSA'] = float(patient_info_dict.get('BSA', np.nan))
+            patient_info_dict['ED'] = int(patient_info_dict.get('ED', -1)) # End-Diastolic frame index
+            patient_info_dict['ES'] = int(patient_info_dict.get('ES', -1)) # End-Systolic frame index
+            patient_info_dict['Group'] = patient_info_dict.get('Group', 'Unknown')
+        patient_infos.append(patient_info_dict)
 
+        # Load cine MRI images (4D NIfTI: frames x slices x height x width)
+        # and corresponding segmentation masks (if available)
+        img_nifti_path = os.path.join(patient_path, f'{patient_dir_name}_4d.nii.gz')
+        mask_nifti_path = os.path.join(patient_path, f'{patient_dir_name}_4d_gt.nii.gz') # Ground truth mask
+
+        if not os.path.exists(img_nifti_path):
+            print(f"Warning: Image file not found for {patient_dir_name}: {img_nifti_path}")
+            continue
+
+        try:
+            img_nifti = nib.load(img_nifti_path)
+            img_data = img_nifti.get_fdata() # Get data as a NumPy array
+
+            mask_data = None
+            if is_training and os.path.exists(mask_nifti_path): # Only load masks for training set
+                mask_nifti = nib.load(mask_nifti_path)
+                mask_data = mask_nifti.get_fdata()
+
+            # Process each frame (volume) in the 4D image
+            # img_data shape: (width, height, slices, frames)
+            # We want to iterate through frames, then slices.
+            # Let's assume the order is (x, y, z, t) where t is time/frames
+            num_frames = img_data.shape[-1]
+            num_slices = img_data.shape[-2] # Assuming slices are before frames
+
+            # Function to process and resize images/masks
+            # `order=0` for nearest-neighbor (masks), `order=1` for bilinear (images)
+            # `preserve_range=True` to keep original intensity range
+            # `anti_aliasing=True` for images
+            proc = lambda d, t_sz, is_m: resize(
+                d.astype(np.uint8 if is_m else np.float32), t_sz,
+                order=(0 if is_m else 1), preserve_range=True,
+                anti_aliasing=(not is_m), mode='reflect'
+            )
+
+            for t in range(num_frames):
+                # Optionally, you might only want ED and ES frames as described in the dataset.
+                # For now, we load all frames. You can uncomment/modify the following lines
+                # if you only need ED/ES:
+                # if t != patient_info_dict['ED'] and t != patient_info_dict['ES']:
+                #     continue
+
+                for s in range(num_slices):
+                    # Extract 2D slice from 4D data
+                    # Accessing specific slice and frame: img_data[:, :, s, t]
+                    current_img_slice = img_data[:, :, s, t]
+                    resized_img = np.expand_dims(proc(current_img_slice, target_size, False), axis=-1)
+                    imgs.append(resized_img)
+
+                    if mask_data is not None:
+                        current_mask_slice = mask_data[:, :, s, t]
+                        resized_mask = proc(current_mask_slice, target_size, True)
+                        msks.append(resized_mask)
+
+            current_samples += 1
+
+        except Exception as e:
+            print(f"Error loading data for {patient_dir_name}: {e}")
+
+    # Convert lists to NumPy arrays
     im_np = np.array(imgs, dtype=np.float32) if imgs else np.empty((0, target_size[0], target_size[1], 1), dtype=np.float32)
-    msk_np = np.array(msks, dtype=np.uint8) if msks else None  # <- đơn giản hóa
-    return im_np, msk_np
+    msk_np = np.array(msks, dtype=np.uint8) if msks else None
+
+    # Create DataFrame for patient information
+    patient_info_df = pd.DataFrame(patient_infos)
+
+    return im_np, msk_np #, patient_info_df
 
 # --- Metrics ---
 def evaluate_metrics(model, dataloader, device, num_classes=4):
@@ -458,53 +531,240 @@ def evaluate_metrics(model, dataloader, device, num_classes=4):
         for _ in range(num_classes): [metrics[key].append(0.0) for key in metrics]
     return metrics
 
+import os
+import nibabel as nib
+import numpy as np
+from skimage.transform import resize
+import pandas as pd
+import torch
+from torch.utils.data import DataLoader, TensorDataset
+from sklearn.model_selection import train_test_split
+
+# --- Global Configurations (bạn cần định nghĩa chúng) ---
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+IMG_SIZE = 256  # Kích thước ảnh mong muốn (ví dụ: 256x256)
+NUM_CLASSES = 4 # Số lượng class trong bài toán phân đoạn của bạn (ví dụ: nền, LV, RV, Myocardium)
+BATCH_SIZE = 4 # Kích thước batch cho DataLoader
+
+# --- Hàm load_acdc_data (như đã cung cấp ở câu trả lời trước) ---
+def load_acdc_data(base_directory, is_training=True, target_size=(256, 256), max_samples=None):
+    """
+    Loads images and (optionally) masks from the ACDC dataset in NIfTI format.
+
+    Args:
+        base_directory (str): The root directory where the ACDC dataset is extracted.
+                               Expected structure:
+                               base_directory/training/patientXXX/
+                               base_directory/testing/patientXXX/
+        is_training (bool): If True, loads data from the 'training' subdirectory.
+                            If False, loads data from the 'testing' subdirectory.
+        target_size (tuple): Desired (height, width) for resizing images and masks.
+        max_samples (int, optional): Maximum number of patients to load. Defaults to None (load all).
+
+    Returns:
+        tuple: (images, masks, patient_info).
+               images (np.array): Array of loaded and resized images.
+               masks (np.array): Array of loaded and resized masks (None if not available or is_training=False).
+               patient_info (pd.DataFrame): DataFrame containing patient metadata (weight, height, BSA, class).
+    """
+    imgs, msks, patient_infos = [], [], []
+    current_samples = 0
+
+    # Determine the data subdirectory (training or testing)
+    data_subdir = 'training' if is_training else 'testing'
+    data_path = os.path.join(base_directory, data_subdir)
+
+    if not os.path.exists(data_path):
+        print(f"Error: Directory '{data_path}' not found. Please ensure the dataset is extracted correctly.")
+        return np.array([]), None, pd.DataFrame()
+
+    # Get list of patient directories
+    patient_dirs = sorted([d for d in os.listdir(data_path) if os.path.isdir(os.path.join(data_path, d)) and d.startswith('patient')])
+
+    for patient_dir_name in patient_dirs:
+        if max_samples and current_samples >= max_samples:
+            break
+
+        patient_path = os.path.join(data_path, patient_dir_name)
+
+        # Load patient information (patient.csv)
+        patient_info_path = os.path.join(patient_path, 'Info.cfg')
+        patient_info_dict = {'patient_id': patient_dir_name} # Thêm patient_id
+        if os.path.exists(patient_info_path):
+            with open(patient_info_path, 'r') as f:
+                for line in f:
+                    if ':' in line:
+                        key, value = line.split(':', 1)
+                        patient_info_dict[key.strip()] = value.strip()
+            # Convert relevant info to numerical types
+            patient_info_dict['Weight'] = float(patient_info_dict.get('Weight', np.nan))
+            patient_info_dict['Height'] = float(patient_info_dict.get('Height', np.nan))
+            patient_info_dict['BSA'] = float(patient_info_dict.get('BSA', np.nan))
+            patient_info_dict['ED'] = int(patient_info_dict.get('ED', -1)) # End-Diastolic frame index
+            patient_info_dict['ES'] = int(patient_info_dict.get('ES', -1)) # End-Systolic frame index
+            patient_info_dict['Group'] = patient_info_dict.get('Group', 'Unknown')
+        patient_infos.append(patient_info_dict)
+
+        # Load cine MRI images (4D NIfTI: frames x slices x height x width)
+        # and corresponding segmentation masks (if available)
+        img_nifti_path = os.path.join(patient_path, f'{patient_dir_name}_4d.nii.gz')
+        mask_nifti_path = os.path.join(patient_path, f'{patient_dir_name}_4d_gt.nii.gz') # Ground truth mask
+
+        if not os.path.exists(img_nifti_path):
+            print(f"Warning: Image file not found for {patient_dir_name}: {img_nifti_path}")
+            continue
+
+        try:
+            img_nifti = nib.load(img_nifti_path)
+            img_data = img_nifti.get_fdata() # Get data as a NumPy array
+
+            mask_data = None
+            if is_training and os.path.exists(mask_nifti_path): # Only load masks for training set
+                mask_nifti = nib.load(mask_nifti_path)
+                mask_data = mask_nifti.get_fdata()
+
+            # Process each frame (volume) in the 4D image
+            # img_data shape often: (width, height, slices, frames)
+            # We want to iterate through frames, then slices.
+            # Let's assume the order is (x, y, z, t) where t is time/frames (last dim)
+            num_frames = img_data.shape[-1]
+            num_slices = img_data.shape[-2] # Assuming slices are before frames
+
+            # Function to process and resize images/masks
+            proc = lambda d, t_sz, is_m: resize(
+                d.astype(np.uint8 if is_m else np.float32), t_sz,
+                order=(0 if is_m else 1), preserve_range=True,
+                anti_aliasing=(not is_m), mode='reflect'
+            )
+
+            for t in range(num_frames):
+                # Optionally, you might only want ED and ES frames as described in the dataset.
+                # For now, we load all frames. If you want only ED/ES, uncomment and modify:
+                # if t != patient_info_dict['ED'] and t != patient_info_dict['ES']:
+                #    continue
+
+                for s in range(num_slices):
+                    # Extract 2D slice from 4D data
+                    current_img_slice = img_data[:, :, s, t] # Assuming (W, H, S, T)
+                    resized_img = np.expand_dims(proc(current_img_slice, target_size, False), axis=-1) # Add channel dim
+                    imgs.append(resized_img)
+
+                    if mask_data is not None:
+                        current_mask_slice = mask_data[:, :, s, t] # Assuming (W, H, S, T)
+                        resized_mask = proc(current_mask_slice, target_size, True)
+                        msks.append(resized_mask)
+
+            current_samples += 1
+
+        except Exception as e:
+            print(f"Error loading data for {patient_dir_name}: {e}")
+
+    # Convert lists to NumPy arrays
+    # Ensure channel dimension is last for consistency before permute
+    im_np = np.array(imgs, dtype=np.float32) if imgs else np.empty((0, target_size[0], target_size[1], 1), dtype=np.float32)
+    msk_np = np.array(msks, dtype=np.uint8) if msks else None
+
+    # Create DataFrame for patient information
+    patient_info_df = pd.DataFrame(patient_infos)
+
+    return im_np, msk_np, patient_info_df
+
+
 # --- Main Execution (Centralized Training) ---
 if __name__ == "__main__":
     print(f"Device: {DEVICE}")
-    
-    # --- Load Data ---
-    base_data_path = '/kaggle/input/acdc-dataset/ACDC_preprocessed'
+    base_data_path = '/Users/trannguyenmyanh/Documents/HUST/Physical_MedFL/data/ACDC'
+
+    # Kiểm tra xem đường dẫn có tồn tại và có dữ liệu không
     if not os.path.exists(base_data_path) or not os.listdir(base_data_path):
-        print(f"Path '{base_data_path}' not found/empty. Using DUMMY data.")
-        # Tạo dữ liệu dummy để code chạy được
+        print(f"Path '{base_data_path}' not found or empty. Using DUMMY data.")
+        # Tạo dữ liệu dummy nếu không tìm thấy dữ liệu thật
         X_train_tensor = torch.randn(100, 1, IMG_SIZE, IMG_SIZE) # 100 mẫu huấn luyện
+        # Đối với segmentation, y_train_tensor cũng là một tensor ảnh
         y_train_tensor = torch.randint(0, NUM_CLASSES, (100, IMG_SIZE, IMG_SIZE))
         X_val_tensor = torch.randn(20, 1, IMG_SIZE, IMG_SIZE) # 20 mẫu validation
         y_val_tensor = torch.randint(0, NUM_CLASSES, (20, IMG_SIZE, IMG_SIZE))
+        X_test_tensor = torch.randn(30, 1, IMG_SIZE, IMG_SIZE) # 30 mẫu test
+        y_test_tensor = torch.randint(0, NUM_CLASSES, (30, IMG_SIZE, IMG_SIZE))
+
     else:
-        train_dir = os.path.join(base_data_path, 'ACDC_training_slices')
-        test_dir = os.path.join(base_data_path, 'ACDC_testing_volumes') # Nếu cần test set riêng
-        
         # Tải toàn bộ dữ liệu huấn luyện
-        all_train_images_np, all_train_masks_np = load_h5_data(train_dir, is_training=True, target_size=(IMG_SIZE, IMG_SIZE), max_samples=600) # Giảm max_samples cho nhanh
-        all_test_images_np, all_test_masks_np = load_h5_data(test_dir, is_training=False, target_size=(IMG_SIZE, IMG_SIZE), max_samples=200)
-        
+        print("Loading training data (all patients)...")
+        all_train_images_np, all_train_masks_np, train_patient_info = load_acdc_data(
+            base_data_path,
+            is_training=True,
+            target_size=(IMG_SIZE, IMG_SIZE),
+            max_samples=None # Tải tất cả bệnh nhân để huấn luyện/validation
+        )
+        print(f"Loaded {len(all_train_images_np)} training images.")
+        print(f"Shape of training images: {all_train_images_np.shape}")
+        if all_train_masks_np is not None:
+            print(f"Shape of training masks: {all_train_masks_np.shape}")
+        print("Training patient info head:")
+        print(train_patient_info.head())
+
+        # Tải toàn bộ dữ liệu kiểm tra
+        print("\nLoading testing data (all patients)...")
+        all_test_images_np, all_test_masks_np, test_patient_info = load_acdc_data(
+            base_data_path,
+            is_training=False, # Mask không có cho tập kiểm tra
+            target_size=(IMG_SIZE, IMG_SIZE),
+            max_samples=None # Tải tất cả bệnh nhân để kiểm tra
+        )
+        print(f"Loaded {len(all_test_images_np)} testing images.")
+        print(f"Shape of testing images: {all_test_images_np.shape}")
+        if all_test_masks_np is None:
+            print("No masks loaded for testing set (as expected).")
+        print("Testing patient info head:")
+        print(test_patient_info.head())
+
         if all_train_images_np.size == 0:
             raise ValueError("Training data is empty after loading. Check data path and content.")
-        
-        # Normalize
+
+    # ... (phần code phía trên không đổi)
+
+        if all_test_images_np.size == 0:
+            print("Warning: Test data is empty after loading. Evaluation might be affected.")
+
+        # Normalize ảnh về khoảng [0, 1]
         if np.max(all_train_images_np) > 0:
             all_train_images_np = all_train_images_np / np.max(all_train_images_np)
-
         if np.max(all_test_images_np) > 0:
             all_test_images_np = all_test_images_np / np.max(all_test_images_np)
-        
+
+        # Chuyển đổi dữ liệu kiểm tra sang Tensor và tạo DataLoader
         X_test_tensor = torch.tensor(all_test_images_np).permute(0, 3, 1, 2).float()
-        y_test_tensor = torch.tensor(all_test_masks_np).long()
-        
-        test_dataset = TensorDataset(X_test_tensor, y_test_tensor)
+
+        # Xử lý y_test_tensor: chỉ tạo nếu mask có sẵn, nếu không thì dùng nhãn giả hoặc không dùng
+        if all_test_masks_np is not None:
+            y_test_tensor = torch.tensor(all_test_masks_np).long()
+            test_dataset = TensorDataset(X_test_tensor, y_test_tensor)
+            print("Test DataLoader will include masks.")
+        else:
+            # Nếu không có mask, tạo DataLoader chỉ với ảnh
+            test_dataset = TensorDataset(X_test_tensor) # Chỉ có ảnh
+            print("Test DataLoader will NOT include masks (as they are not available for testing set).")
+            # Hoặc bạn có thể tạo một dummy tensor nếu mô hình của bạn *bắt buộc* phải nhận nhãn
+            # Nhưng việc này không được khuyến khích cho việc đánh giá thực tế.
+            # dummy_labels = torch.zeros(X_test_tensor.shape[0], IMG_SIZE, IMG_SIZE, dtype=torch.long)
+            # test_dataset = TensorDataset(X_test_tensor, dummy_labels)
+
+
         test_dataloader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=2, pin_memory=True if DEVICE.type == 'cuda' else False)
-        
-        # Chia train/validation từ toàn bộ dữ liệu đã tải
+        print(f"Test samples: {len(test_dataset)}")
+
+        # Chia train/validation từ toàn bộ dữ liệu huấn luyện đã tải
         X_train_np, X_val_np, y_train_np, y_val_np = train_test_split(
             all_train_images_np, all_train_masks_np, test_size=0.2, random_state=42 # 20% cho validation
         )
-        
+
+        # Chuyển đổi dữ liệu huấn luyện và validation sang Tensor và tạo DataLoader
         X_train_tensor = torch.tensor(X_train_np).permute(0, 3, 1, 2).float()
         y_train_tensor = torch.tensor(y_train_np).long()
         X_val_tensor = torch.tensor(X_val_np).permute(0, 3, 1, 2).float()
         y_val_tensor = torch.tensor(y_val_np).long()
 
+    # Kiểm tra kích thước của các tập dữ liệu sau khi chia
     if len(X_train_tensor) == 0: raise ValueError("No training samples after split.")
     if len(X_val_tensor) == 0: print("Warning: Validation set is empty after split.")
 
@@ -513,8 +773,8 @@ if __name__ == "__main__":
 
     train_dataloader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=2, pin_memory=True if DEVICE.type == 'cuda' else False)
     val_dataloader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=2, pin_memory=True if DEVICE.type == 'cuda' else False)
-    
-    print(f"Training samples: {len(train_dataset)}, Validation samples: {len(val_dataset)}")
+
+    print(f"\nTraining samples: {len(train_dataset)}, Validation samples: {len(val_dataset)}")
     print("Data loaded and prepared for centralized training.")
 
     # --- Initialize Model, Criterion, Optimizer ---
