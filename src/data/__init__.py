@@ -1,39 +1,55 @@
 """
-Data handling modules for the federated learning project.
+Unified data handling modules for federated learning with medical imaging datasets.
+Supports ACDC (cardiac segmentation) and BraTS2020 (brain tumor segmentation).
 """
 
+# Unified Dataset System
 from .dataset import (
-    MedicalSegmentationDataset,
-    ACDCDataset,
-    InMemoryDataset,
-    create_dataset_from_paths,
-    compute_class_weights
+    BaseUnifiedDataset,
+    ACDCUnifiedDataset,
+    BraTS2020UnifiedDataset,
+    UnifiedDatasetManager,
+    create_unified_dataset,
+    create_multi_dataset_loader,
+    DatasetType
 )
+
+# Unified Loader System
 from .loader import (
-    create_dataloader,
-    create_dataloader_from_paths,
-    create_acdc_dataloader,
-    create_federated_dataloaders
+    UnifiedFederatedLoader,
+    create_acdc_loader,
+    create_brats_loader,
+    create_multi_medical_loader
 )
+
+# Core Components
 from .preprocessing import (
     MedicalImagePreprocessor,
     DataAugmentation
 )
+
 from .partitioning import (
     FederatedDataPartitioner,
     create_federated_splits
 )
 
 __all__ = [
-    'MedicalSegmentationDataset',
-    'ACDCDataset', 
-    'InMemoryDataset',
-    'create_dataset_from_paths',
-    'compute_class_weights',
-    'create_dataloader',
-    'create_dataloader_from_paths',
-    'create_acdc_dataloader',
-    'create_federated_dataloaders',
+    # Unified Dataset Classes
+    'BaseUnifiedDataset',
+    'ACDCUnifiedDataset',
+    'BraTS2020UnifiedDataset',
+    'UnifiedDatasetManager',
+    'create_unified_dataset',
+    'create_multi_dataset_loader',
+    'DatasetType',
+    
+    # Unified Loader Classes
+    'UnifiedFederatedLoader',
+    'create_acdc_loader',
+    'create_brats_loader',
+    'create_multi_medical_loader',
+    
+    # Core Components
     'MedicalImagePreprocessor',
     'DataAugmentation',
     'FederatedDataPartitioner',

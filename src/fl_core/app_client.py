@@ -28,8 +28,7 @@ from flwr.common import Context, Config, NDArrays, Scalar
 
 # 1.4 Project-Specific Imports
 try:
-    from src.models.mlp_model import OptimizedRobustMedVFL_UNet
-    from src.models.model_factory import create_model, get_model_info
+    from src.models.mlp_model import RobustMedVFL_UNet
     from src.data.dataset import ACDCDataset, MedicalSegmentationDataset
     from src.data.loader import create_acdc_dataloader, create_dataloader_from_paths
     from src.data.preprocessing import MedicalImagePreprocessor, DataAugmentation
@@ -266,21 +265,14 @@ class FlowerClient(NumPyClient):
             
             if SRC_IMPORTS_AVAILABLE:
                 self.logger.info("Using SRC imports for model")
-                from src.models.mlp_model import OptimizedRobustMedVFL_UNet
+                from src.models.mlp_model import RobustMedVFL_UNet
                 
                 # Debug model config
                 self.logger.info(f"Model config: {self.model_config}")
                 
-                self.model = OptimizedRobustMedVFL_UNet(
+                self.model = RobustMedVFL_UNet(
                     n_channels=self.model_config['n_channels'],
                     n_classes=self.model_config['n_classes'],
-                    dropout_rate=self.model_config['dropout_rate'],
-                    pruning_config={
-                        'noise_processing_levels': [0, 1],
-                        'maxwell_solver_levels': [0, 1],
-                        'dropout_positions': [0],
-                        'skip_quantum_noise': False
-                    }
                 ).to(self.device)
                 
                 # CRITICAL: Ensure model is in training mode and parameters are trainable
@@ -1353,24 +1345,24 @@ class FlowerClient(NumPyClient):
 
 # 5. CLIENT FACTORY FUNCTION
 
-def client_fn(cid: str) -> Client:
+def client_fn(context: Context) -> Client:
     """
     Create and configure a FlowerClient instance.
     
     Args:
-        cid: Client ID string
+        context: Flower Context containing client configuration
         
     Returns:
         Configured FlowerClient instance as Client
     """
     try:
         # 5.1 Client ID Processing
-        # Parse client ID to get partition number
-        partition_id = int(cid) if cid.isdigit() else 0
+        # Extract client ID from context
+        client_id = str(context.node_id)
+        partition_id = context.node_id if context.node_id is not None else 0
         num_partitions = 10  # Default number of partitions
         
         # 5.2 Environment Setup
-        client_id = str(partition_id)
         
         # Set reproducible seed based on partition ID
         set_seed(42 + int(partition_id))
@@ -1395,8 +1387,9 @@ def client_fn(cid: str) -> Client:
             logger.info(f"Client-specific path not found, using base path: {client_data_path}")
         
         # 5.4 Model Configuration
-        model_config_raw = {}  # Default empty config
-        training_config_raw = {}  # Default empty config
+        # Extract configuration from context if available
+        model_config_raw = context.run_config.get("model_config", {}) if context.run_config else {}
+        training_config_raw = context.run_config.get("training_config", {}) if context.run_config else {}
         
         # Ensure configs are dictionaries
         model_config = model_config_raw if isinstance(model_config_raw, dict) else {}
@@ -1468,5 +1461,5 @@ __all__ = ["app", "FlowerClient", "client_fn"]
 
 # Version and compatibility information
 __version__ = "1.0.0"
-__flower_version__ = "1.8.0"
-__description__ = "Comprehensive Federated Learning Client for Medical Image Segmentation" 
+__flower_version__ = "1.18.0"  # Cập nhật version
+__description__ = "Comprehensive Federated Learning Client for Medical Image Segmentation"

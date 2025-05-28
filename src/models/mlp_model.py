@@ -5,10 +5,42 @@ import torch.nn.functional as F
 import numpy as np
 import time
 import os
-import h5py
 from skimage.transform import resize
 from torch.utils.data import TensorDataset, DataLoader
 from sklearn.model_selection import train_test_split
+
+# Import unified data system
+try:
+    from src.data import (
+        UnifiedFederatedLoader,
+        create_acdc_loader,
+        create_brats_loader,
+        create_multi_medical_loader,
+        ACDCUnifiedDataset,
+        BraTS2020UnifiedDataset,
+        MedicalImagePreprocessor,
+        DataAugmentation
+    )
+    UNIFIED_DATA_AVAILABLE = True
+except ImportError:
+    try:
+        # Try alternative import path when running as script
+        import sys
+        sys.path.append('.')
+        from src.data import (
+            UnifiedFederatedLoader,
+            create_acdc_loader,
+            create_brats_loader,
+            create_multi_medical_loader,
+            ACDCUnifiedDataset,
+            BraTS2020UnifiedDataset,
+            MedicalImagePreprocessor,
+            DataAugmentation
+        )
+        UNIFIED_DATA_AVAILABLE = True
+    except ImportError:
+        print("Warning: Unified data system not available")
+        UNIFIED_DATA_AVAILABLE = False
 
 # --- Configuration ---
 NUM_EPOCHS_CENTRALIZED = 50 
@@ -22,7 +54,7 @@ BATCH_SIZE = 8
 class BasicConvBlock(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size=3, padding=1, use_bn=True):
         super().__init__()
-        layers = [nn.Conv2d(in_channels, out_channels, kernel_size=kernel_size, padding=padding, bias=not use_bn)]
+        layers: list[nn.Module] = [nn.Conv2d(in_channels, out_channels, kernel_size=kernel_size, padding=padding, bias=not use_bn)]
         if use_bn:
             layers.append(nn.BatchNorm2d(out_channels))
         layers.append(nn.ReLU(inplace=True))
@@ -92,7 +124,7 @@ def adaptive_spline_smoothing(x, noise_profile, kernel_size=5, sigma=1.0):
     # Ensure sigma values are positive to avoid issues
     sigma_tuple = tuple(max(0.1, s) for s in sigma_tuple) # Add small epsilon
 
-    smoothed = TF.gaussian_blur(x_float, kernel_size=kernel_size_tuple, sigma=sigma_tuple)
+    smoothed = TF.gaussian_blur(x_float, kernel_size=list(kernel_size_tuple), sigma=list(sigma_tuple))
 
     # Bước 2: Chuẩn hóa noise_profile (sigmoid) và mở rộng cho đúng số kênh
     # Sigmoid ensures blending weights are between 0 and 1
@@ -112,29 +144,6 @@ def adaptive_spline_smoothing(x, noise_profile, kernel_size=5, sigma=1.0):
     weighted_sum = x_float * (1 - blending_weights) + smoothed * blending_weights
 
     return weighted_sum
-
-# def quantum_noise_injection(features):
-#     features_float = features.float()
-
-#     if features_float.dim() < 4 or features_float.size(2) < 2 or features_float.size(3) < 2:
-#         print("Warning: Features too small for quantum noise injection.")
-#         return features_float # Return original features as float
-
-#     try:
-#         # Ensure tensors are on the correct device
-#         device = features_float.device
-#         rotated_features = [
-#             features_float,
-#             torch.rot90(features_float, k=1, dims=[-2, -1]),
-#             torch.rot90(features_float, k=2, dims=[-2, -1])
-#         ]
-#         pauli_effect = torch.mean(torch.stack(rotated_features, dim=0), dim=0)
-#         noise = 0.1 * pauli_effect * torch.randn_like(features_float, device=device)
-#         return features_float + noise
-#     except RuntimeError as e:
-#         print(f"Quantum noise injection failed: {e}. Returning original features.")
-#         # Return original features as float if error occurs
-#         return features_float
 
 def quantum_noise_injection(features, T=1.0, pauli_prob={'X': 0.00096, 'Y': 0.00096, 'Z': 0.00096, 'None': 0.99712}):
     """
@@ -296,10 +305,13 @@ class RobustMedVFL_UNet(nn.Module):
     
 # --- Loss Functions ---
 class DiceLoss(nn.Module):
-    def __init__(self, num_classes=4, smooth=1e-6): # Đã dùng num_classes
-        super().__init__(); self.num_classes, self.smooth = num_classes, smooth
+    def __init__(self, num_classes=4, smooth=1e-6):
+        super().__init__()
+        self.num_classes, self.smooth = num_classes, smooth
+        
     def forward(self, inputs, targets):
-        inputs = F.softmax(inputs, dim=1); loss = 0
+        inputs = F.softmax(inputs, dim=1)
+        loss = 0
         for i in range(self.num_classes):
             inp_c = inputs[:,i,:,:].contiguous().view(-1)
             tgt_c = (targets==i).float().contiguous().view(-1)
@@ -310,572 +322,465 @@ class DiceLoss(nn.Module):
 
 class PhysicsLoss(nn.Module):
     def __init__(self, in_channels_solver):
-        super().__init__(); self.ms = MaxwellSolver(in_channels_solver)
+        super().__init__()
+        self.ms = MaxwellSolver(in_channels_solver)
+        
     def forward(self, b1, eps, sig):
         b,e,s = b1.to(DEVICE), eps.to(DEVICE), sig.to(DEVICE)
         return torch.mean(self.ms.compute_helmholtz_residual(b,e,s))
 
 class SmoothnessLoss(nn.Module):
-    def __init__(self): super().__init__()
+    def __init__(self):
+        super().__init__()
+        
     def forward(self, x):
-        dy = torch.abs(x[:,:,1:,:]-x[:,:,:-1,:]); dx = torch.abs(x[:,:,:,1:]-x[:,:,:,:-1])
+        dy = torch.abs(x[:,:,1:,:]-x[:,:,:-1,:])
+        dx = torch.abs(x[:,:,:,1:]-x[:,:,:,:-1])
         return torch.mean(dy) + torch.mean(dx)
 
 class CombinedLoss(nn.Module):
     def __init__(self, wc=.5, wd=.5, wp=.1, ws=.01, in_channels_maxwell=1024, num_classes=4):
-        super().__init__()
-        self.ce = nn.CrossEntropyLoss()
-        self.dl = DiceLoss(num_classes=num_classes) # Khởi tạo DiceLoss với num_classes
-        self.pl = PhysicsLoss(in_channels_solver=in_channels_maxwell) # Đổi tên cho rõ nghĩa
-        self.sl = SmoothnessLoss()
-        self.wc,self.wd,self.wp,self.ws = wc,wd,wp,ws
-        # self.num_classes = num_classes # Có thể lưu lại nếu cần dùng ở đâu khác trong CombinedLoss
+        super(CombinedLoss, self).__init__()
+        self.ce_loss = nn.CrossEntropyLoss()
+        self.dice_loss = DiceLoss(num_classes=num_classes)
+        self.physics_loss = PhysicsLoss(in_channels_solver=in_channels_maxwell)
+        self.smoothness_loss = SmoothnessLoss()
+        self.wc = wc; self.wd = wd; self.wp = wp; self.ws = ws
 
     def forward(self, logits, targets, b1, all_es, feat_sm=None):
-        lce = self.ce(logits,targets.long())
-        ldc = self.dl(logits,targets.long()) # DiceLoss đã có num_classes từ __init__
-        loss = self.wc*lce + self.wd*ldc
+        loss_ce = self.ce_loss(logits, targets)
+        loss_dice = self.dice_loss(logits, targets)
+        loss_physics = self.physics_loss(b1, all_es[:,:,0], all_es[:,:,1])
         
-        lphy = torch.tensor(0.,device=logits.device)
-        if b1 is not None and all_es and len(all_es)>0:
-            # Giả sử all_es[0] là tuple (eps, sigma) từ tầng decoder quan trọng nhất
-            e1,s1 = all_es[0] 
-            lphy=self.pl(b1,e1,s1)
-            loss+=self.wp*lphy
-            
-        lsm = torch.tensor(0.,device=logits.device)
+        total_loss = self.wc * loss_ce + self.wd * loss_dice + self.wp * loss_physics
+        
         if feat_sm is not None:
-            lsm=self.sl(feat_sm)
-            loss+=self.ws*lsm
-        return loss
+            loss_smoothness = self.smoothness_loss(feat_sm)
+            total_loss += self.ws * loss_smoothness
+        
+        return total_loss
 
-# def load_h5_data(directory, is_training=True, target_size=(256,256), max_samples=None):
-#     imgs, msks, count = [], [], 0
-#     if not os.path.exists(directory):
-#         return np.array([]), (np.array([]) if is_training else None)
 
-#     for fname in sorted(os.listdir(directory)):
-#         if max_samples and count >= max_samples:
-#             break
-#         if fname.endswith('.h5'):
-#             try:
-#                 with h5py.File(os.path.join(directory, fname), 'r') as f:
-#                     img_d = f['image'][:]
-#                     msk_d = f['label'][:] if 'label' in f else None  # <- luôn cố load label nếu có
+# ===========================================
+# DATA-MODEL INTEGRATION FUNCTIONS
+# ===========================================
 
-#                     proc = lambda d, t_sz, is_m: resize(
-#                         d.astype(np.uint8 if is_m else np.float32), t_sz,
-#                         order=(0 if is_m else 1), preserve_range=True,
-#                         anti_aliasing=(not is_m), mode='reflect'
-#                     ).astype(np.uint8 if is_m else np.float32)
-
-#                     if img_d.ndim == 3:
-#                         for i in range(img_d.shape[0]):
-#                             imgs.append(np.expand_dims(proc(img_d[i], target_size, False), axis=-1))
-#                             if msk_d is not None:
-#                                 msks.append(proc(msk_d[i], target_size, True))
-#                     elif img_d.ndim == 2:
-#                         imgs.append(np.expand_dims(proc(img_d, target_size, False), axis=-1))
-#                         if msk_d is not None:
-#                             msks.append(proc(msk_d, target_size, True))
-#                 count += 1
-#             except Exception as e:
-#                 print(f"Err load {fname}: {e}")
-
-#     im_np = np.array(imgs, dtype=np.float32) if imgs else np.empty((0, target_size[0], target_size[1], 1), dtype=np.float32)
-#     msk_np = np.array(msks, dtype=np.uint8) if msks else None  # <- đơn giản hóa
-#     return im_np, msk_np
-
-import os
-import nibabel as nib
-import numpy as np
-from skimage.transform import resize
-import pandas as pd
-
-def load_acdc_data(base_directory, is_training=True, target_size=(256, 256), max_samples=None):
-    imgs, msks, patient_infos = [], [], []
-    current_samples = 0
-
-    # Determine the data subdirectory (training or testing)
-    data_subdir = 'training' if is_training else 'testing'
-    data_path = os.path.join(base_directory, data_subdir)
-
-    if not os.path.exists(data_path):
-        print(f"Error: Directory '{data_path}' not found. Please ensure the dataset is extracted correctly.")
-        return np.array([]), None, pd.DataFrame()
-
-    # Get list of patient directories
-    patient_dirs = sorted([d for d in os.listdir(data_path) if os.path.isdir(os.path.join(data_path, d)) and d.startswith('patient')])
-
-    for patient_dir_name in patient_dirs:
-        if max_samples and current_samples >= max_samples:
-            break
-
-        patient_path = os.path.join(data_path, patient_dir_name)
-
-        # Load patient information (patient.csv)
-        patient_info_path = os.path.join(patient_path, 'Info.cfg')
-        patient_info_dict = {}
-        if os.path.exists(patient_info_path):
-            with open(patient_info_path, 'r') as f:
-                for line in f:
-                    if ':' in line:
-                        key, value = line.split(':', 1)
-                        patient_info_dict[key.strip()] = value.strip()
-            # Convert relevant info to numerical types
-            patient_info_dict['Weight'] = float(patient_info_dict.get('Weight', np.nan))
-            patient_info_dict['Height'] = float(patient_info_dict.get('Height', np.nan))
-            patient_info_dict['BSA'] = float(patient_info_dict.get('BSA', np.nan))
-            patient_info_dict['ED'] = int(patient_info_dict.get('ED', -1)) # End-Diastolic frame index
-            patient_info_dict['ES'] = int(patient_info_dict.get('ES', -1)) # End-Systolic frame index
-            patient_info_dict['Group'] = patient_info_dict.get('Group', 'Unknown')
-        patient_infos.append(patient_info_dict)
-
-        # Load cine MRI images (4D NIfTI: frames x slices x height x width)
-        # and corresponding segmentation masks (if available)
-        img_nifti_path = os.path.join(patient_path, f'{patient_dir_name}_4d.nii.gz')
-        mask_nifti_path = os.path.join(patient_path, f'{patient_dir_name}_4d_gt.nii.gz') # Ground truth mask
-
-        if not os.path.exists(img_nifti_path):
-            print(f"Warning: Image file not found for {patient_dir_name}: {img_nifti_path}")
-            continue
-
-        try:
-            img_nifti = nib.load(img_nifti_path)
-            img_data = img_nifti.get_fdata() # Get data as a NumPy array
-
-            mask_data = None
-            if is_training and os.path.exists(mask_nifti_path): # Only load masks for training set
-                mask_nifti = nib.load(mask_nifti_path)
-                mask_data = mask_nifti.get_fdata()
-
-            # Process each frame (volume) in the 4D image
-            # img_data shape: (width, height, slices, frames)
-            # We want to iterate through frames, then slices.
-            # Let's assume the order is (x, y, z, t) where t is time/frames
-            num_frames = img_data.shape[-1]
-            num_slices = img_data.shape[-2] # Assuming slices are before frames
-
-            # Function to process and resize images/masks
-            # `order=0` for nearest-neighbor (masks), `order=1` for bilinear (images)
-            # `preserve_range=True` to keep original intensity range
-            # `anti_aliasing=True` for images
-            proc = lambda d, t_sz, is_m: resize(
-                d.astype(np.uint8 if is_m else np.float32), t_sz,
-                order=(0 if is_m else 1), preserve_range=True,
-                anti_aliasing=(not is_m), mode='reflect'
-            )
-
-            for t in range(num_frames):
-                # Optionally, you might only want ED and ES frames as described in the dataset.
-                # For now, we load all frames. You can uncomment/modify the following lines
-                # if you only need ED/ES:
-                # if t != patient_info_dict['ED'] and t != patient_info_dict['ES']:
-                #     continue
-
-                for s in range(num_slices):
-                    # Extract 2D slice from 4D data
-                    # Accessing specific slice and frame: img_data[:, :, s, t]
-                    current_img_slice = img_data[:, :, s, t]
-                    resized_img = np.expand_dims(proc(current_img_slice, target_size, False), axis=-1)
-                    imgs.append(resized_img)
-
-                    if mask_data is not None:
-                        current_mask_slice = mask_data[:, :, s, t]
-                        resized_mask = proc(current_mask_slice, target_size, True)
-                        msks.append(resized_mask)
-
-            current_samples += 1
-
-        except Exception as e:
-            print(f"Error loading data for {patient_dir_name}: {e}")
-
-    # Convert lists to NumPy arrays
-    im_np = np.array(imgs, dtype=np.float32) if imgs else np.empty((0, target_size[0], target_size[1], 1), dtype=np.float32)
-    msk_np = np.array(msks, dtype=np.uint8) if msks else None
-
-    # Create DataFrame for patient information
-    patient_info_df = pd.DataFrame(patient_infos)
-
-    return im_np, msk_np #, patient_info_df
-
-# --- Metrics ---
-def evaluate_metrics(model, dataloader, device, num_classes=4):
-    model.eval()
-    tp = [0] * num_classes
-    fp = [0] * num_classes
-    fn = [0] * num_classes
-    dice_s = [0.0] * num_classes
-    iou_s = [0.0] * num_classes
-    batches = 0
-
-    with torch.no_grad():
-        for imgs,tgts in dataloader:
-            imgs,tgts = imgs.to(device),tgts.to(device)
-            if imgs.size(0) == 0: continue
-            logits,_ = model(imgs)
-            preds = torch.argmax(F.softmax(logits,dim=1),dim=1); batches+=1
-            for c in range(num_classes):
-                pc_f,tc_f=(preds==c).float().view(-1),(tgts==c).float().view(-1); inter=(pc_f*tc_f).sum()
-                dice_s[c]+=((2.*inter+1e-6)/(pc_f.sum()+tc_f.sum()+1e-6)).item()
-                iou_s[c]+=((inter+1e-6)/(pc_f.sum()+tc_f.sum()-inter+1e-6)).item()
-                tp[c]+=inter.item(); fp[c]+=(pc_f.sum()-inter).item(); fn[c]+=(tc_f.sum()-inter).item()
-    metrics={'dice_scores':[],'iou':[],'precision':[],'recall':[],'f1_score':[]}
-    if batches>0:
-        for c in range(num_classes):
-            metrics['dice_scores'].append(dice_s[c]/batches); metrics['iou'].append(iou_s[c]/batches)
-            prec,rec = tp[c]/(tp[c]+fp[c]+1e-6), tp[c]/(tp[c]+fn[c]+1e-6)
-            metrics['precision'].append(prec); metrics['recall'].append(rec)
-            metrics['f1_score'].append(2*prec*rec/(prec+rec+1e-6) if (prec+rec > 0) else 0.0)
-    else: 
-        for _ in range(num_classes): [metrics[key].append(0.0) for key in metrics]
-    return metrics
-
-import os
-import nibabel as nib
-import numpy as np
-from skimage.transform import resize
-import pandas as pd
-import torch
-from torch.utils.data import DataLoader, TensorDataset
-from sklearn.model_selection import train_test_split
-
-# --- Global Configurations (bạn cần định nghĩa chúng) ---
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-IMG_SIZE = 256  # Kích thước ảnh mong muốn (ví dụ: 256x256)
-NUM_CLASSES = 4 # Số lượng class trong bài toán phân đoạn của bạn (ví dụ: nền, LV, RV, Myocardium)
-BATCH_SIZE = 4 # Kích thước batch cho DataLoader
-
-# --- Hàm load_acdc_data (như đã cung cấp ở câu trả lời trước) ---
-def load_acdc_data(base_directory, is_training=True, target_size=(256, 256), max_samples=None):
+def create_unified_data_loader(
+    acdc_data_dir: str = None,
+    brats_data_dir: str = None,
+    dataset_type: str = "combined",  # "acdc", "brats2020", "combined"
+    batch_size: int = 8,
+    shuffle: bool = True,
+    apply_augmentation: bool = True,
+    preprocessor_config: dict = None,
+    augmentation_config: dict = None,
+    **kwargs
+) -> DataLoader:
     """
-    Loads images and (optionally) masks from the ACDC dataset in NIfTI format.
-
-    Args:
-        base_directory (str): The root directory where the ACDC dataset is extracted.
-                               Expected structure:
-                               base_directory/training/patientXXX/
-                               base_directory/testing/patientXXX/
-        is_training (bool): If True, loads data from the 'training' subdirectory.
-                            If False, loads data from the 'testing' subdirectory.
-        target_size (tuple): Desired (height, width) for resizing images and masks.
-        max_samples (int, optional): Maximum number of patients to load. Defaults to None (load all).
-
-    Returns:
-        tuple: (images, masks, patient_info).
-               images (np.array): Array of loaded and resized images.
-               masks (np.array): Array of loaded and resized masks (None if not available or is_training=False).
-               patient_info (pd.DataFrame): DataFrame containing patient metadata (weight, height, BSA, class).
-    """
-    imgs, msks, patient_infos = [], [], []
-    current_samples = 0
-
-    # Determine the data subdirectory (training or testing)
-    data_subdir = 'training' if is_training else 'testing'
-    data_path = os.path.join(base_directory, data_subdir)
-
-    if not os.path.exists(data_path):
-        print(f"Error: Directory '{data_path}' not found. Please ensure the dataset is extracted correctly.")
-        return np.array([]), None, pd.DataFrame()
-
-    # Get list of patient directories
-    patient_dirs = sorted([d for d in os.listdir(data_path) if os.path.isdir(os.path.join(data_path, d)) and d.startswith('patient')])
-
-    for patient_dir_name in patient_dirs:
-        if max_samples and current_samples >= max_samples:
-            break
-
-        patient_path = os.path.join(data_path, patient_dir_name)
-
-        # Load patient information (patient.csv)
-        patient_info_path = os.path.join(patient_path, 'Info.cfg')
-        patient_info_dict = {'patient_id': patient_dir_name} # Thêm patient_id
-        if os.path.exists(patient_info_path):
-            with open(patient_info_path, 'r') as f:
-                for line in f:
-                    if ':' in line:
-                        key, value = line.split(':', 1)
-                        patient_info_dict[key.strip()] = value.strip()
-            # Convert relevant info to numerical types
-            patient_info_dict['Weight'] = float(patient_info_dict.get('Weight', np.nan))
-            patient_info_dict['Height'] = float(patient_info_dict.get('Height', np.nan))
-            patient_info_dict['BSA'] = float(patient_info_dict.get('BSA', np.nan))
-            patient_info_dict['ED'] = int(patient_info_dict.get('ED', -1)) # End-Diastolic frame index
-            patient_info_dict['ES'] = int(patient_info_dict.get('ES', -1)) # End-Systolic frame index
-            patient_info_dict['Group'] = patient_info_dict.get('Group', 'Unknown')
-        patient_infos.append(patient_info_dict)
-
-        # Load cine MRI images (4D NIfTI: frames x slices x height x width)
-        # and corresponding segmentation masks (if available)
-        img_nifti_path = os.path.join(patient_path, f'{patient_dir_name}_4d.nii.gz')
-        mask_nifti_path = os.path.join(patient_path, f'{patient_dir_name}_4d_gt.nii.gz') # Ground truth mask
-
-        if not os.path.exists(img_nifti_path):
-            print(f"Warning: Image file not found for {patient_dir_name}: {img_nifti_path}")
-            continue
-
-        try:
-            img_nifti = nib.load(img_nifti_path)
-            img_data = img_nifti.get_fdata() # Get data as a NumPy array
-
-            mask_data = None
-            if is_training and os.path.exists(mask_nifti_path): # Only load masks for training set
-                mask_nifti = nib.load(mask_nifti_path)
-                mask_data = mask_nifti.get_fdata()
-
-            # Process each frame (volume) in the 4D image
-            # img_data shape often: (width, height, slices, frames)
-            # We want to iterate through frames, then slices.
-            # Let's assume the order is (x, y, z, t) where t is time/frames (last dim)
-            num_frames = img_data.shape[-1]
-            num_slices = img_data.shape[-2] # Assuming slices are before frames
-
-            # Function to process and resize images/masks
-            proc = lambda d, t_sz, is_m: resize(
-                d.astype(np.uint8 if is_m else np.float32), t_sz,
-                order=(0 if is_m else 1), preserve_range=True,
-                anti_aliasing=(not is_m), mode='reflect'
-            )
-
-            for t in range(num_frames):
-                # Optionally, you might only want ED and ES frames as described in the dataset.
-                # For now, we load all frames. If you want only ED/ES, uncomment and modify:
-                # if t != patient_info_dict['ED'] and t != patient_info_dict['ES']:
-                #    continue
-
-                for s in range(num_slices):
-                    # Extract 2D slice from 4D data
-                    current_img_slice = img_data[:, :, s, t] # Assuming (W, H, S, T)
-                    resized_img = np.expand_dims(proc(current_img_slice, target_size, False), axis=-1) # Add channel dim
-                    imgs.append(resized_img)
-
-                    if mask_data is not None:
-                        current_mask_slice = mask_data[:, :, s, t] # Assuming (W, H, S, T)
-                        resized_mask = proc(current_mask_slice, target_size, True)
-                        msks.append(resized_mask)
-
-            current_samples += 1
-
-        except Exception as e:
-            print(f"Error loading data for {patient_dir_name}: {e}")
-
-    # Convert lists to NumPy arrays
-    # Ensure channel dimension is last for consistency before permute
-    im_np = np.array(imgs, dtype=np.float32) if imgs else np.empty((0, target_size[0], target_size[1], 1), dtype=np.float32)
-    msk_np = np.array(msks, dtype=np.uint8) if msks else None
-
-    # Create DataFrame for patient information
-    patient_info_df = pd.DataFrame(patient_infos)
-
-    return im_np, msk_np, patient_info_df
-
-
-# --- Main Execution (Centralized Training) ---
-if __name__ == "__main__":
-    print(f"Device: {DEVICE}")
-    base_data_path = '/Users/trannguyenmyanh/Documents/HUST/Physical_MedFL/data/ACDC'
-
-    # Kiểm tra xem đường dẫn có tồn tại và có dữ liệu không
-    if not os.path.exists(base_data_path) or not os.listdir(base_data_path):
-        print(f"Path '{base_data_path}' not found or empty. Using DUMMY data.")
-        # Tạo dữ liệu dummy nếu không tìm thấy dữ liệu thật
-        X_train_tensor = torch.randn(100, 1, IMG_SIZE, IMG_SIZE) # 100 mẫu huấn luyện
-        # Đối với segmentation, y_train_tensor cũng là một tensor ảnh
-        y_train_tensor = torch.randint(0, NUM_CLASSES, (100, IMG_SIZE, IMG_SIZE))
-        X_val_tensor = torch.randn(20, 1, IMG_SIZE, IMG_SIZE) # 20 mẫu validation
-        y_val_tensor = torch.randint(0, NUM_CLASSES, (20, IMG_SIZE, IMG_SIZE))
-        X_test_tensor = torch.randn(30, 1, IMG_SIZE, IMG_SIZE) # 30 mẫu test
-        y_test_tensor = torch.randint(0, NUM_CLASSES, (30, IMG_SIZE, IMG_SIZE))
-
-    else:
-        # Tải toàn bộ dữ liệu huấn luyện
-        print("Loading training data (all patients)...")
-        all_train_images_np, all_train_masks_np, train_patient_info = load_acdc_data(
-            base_data_path,
-            is_training=True,
-            target_size=(IMG_SIZE, IMG_SIZE),
-            max_samples=None # Tải tất cả bệnh nhân để huấn luyện/validation
-        )
-        print(f"Loaded {len(all_train_images_np)} training images.")
-        print(f"Shape of training images: {all_train_images_np.shape}")
-        if all_train_masks_np is not None:
-            print(f"Shape of training masks: {all_train_masks_np.shape}")
-        print("Training patient info head:")
-        print(train_patient_info.head())
-
-        # Tải toàn bộ dữ liệu kiểm tra
-        print("\nLoading testing data (all patients)...")
-        all_test_images_np, all_test_masks_np, test_patient_info = load_acdc_data(
-            base_data_path,
-            is_training=False, # Mask không có cho tập kiểm tra
-            target_size=(IMG_SIZE, IMG_SIZE),
-            max_samples=None # Tải tất cả bệnh nhân để kiểm tra
-        )
-        print(f"Loaded {len(all_test_images_np)} testing images.")
-        print(f"Shape of testing images: {all_test_images_np.shape}")
-        if all_test_masks_np is None:
-            print("No masks loaded for testing set (as expected).")
-        print("Testing patient info head:")
-        print(test_patient_info.head())
-
-        if all_train_images_np.size == 0:
-            raise ValueError("Training data is empty after loading. Check data path and content.")
-
-    # ... (phần code phía trên không đổi)
-
-        if all_test_images_np.size == 0:
-            print("Warning: Test data is empty after loading. Evaluation might be affected.")
-
-        # Normalize ảnh về khoảng [0, 1]
-        if np.max(all_train_images_np) > 0:
-            all_train_images_np = all_train_images_np / np.max(all_train_images_np)
-        if np.max(all_test_images_np) > 0:
-            all_test_images_np = all_test_images_np / np.max(all_test_images_np)
-
-        # Chuyển đổi dữ liệu kiểm tra sang Tensor và tạo DataLoader
-        X_test_tensor = torch.tensor(all_test_images_np).permute(0, 3, 1, 2).float()
-
-        # Xử lý y_test_tensor: chỉ tạo nếu mask có sẵn, nếu không thì dùng nhãn giả hoặc không dùng
-        if all_test_masks_np is not None:
-            y_test_tensor = torch.tensor(all_test_masks_np).long()
-            test_dataset = TensorDataset(X_test_tensor, y_test_tensor)
-            print("Test DataLoader will include masks.")
-        else:
-            # Nếu không có mask, tạo DataLoader chỉ với ảnh
-            test_dataset = TensorDataset(X_test_tensor) # Chỉ có ảnh
-            print("Test DataLoader will NOT include masks (as they are not available for testing set).")
-            # Hoặc bạn có thể tạo một dummy tensor nếu mô hình của bạn *bắt buộc* phải nhận nhãn
-            # Nhưng việc này không được khuyến khích cho việc đánh giá thực tế.
-            # dummy_labels = torch.zeros(X_test_tensor.shape[0], IMG_SIZE, IMG_SIZE, dtype=torch.long)
-            # test_dataset = TensorDataset(X_test_tensor, dummy_labels)
-
-
-        test_dataloader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=2, pin_memory=True if DEVICE.type == 'cuda' else False)
-        print(f"Test samples: {len(test_dataset)}")
-
-        # Chia train/validation từ toàn bộ dữ liệu huấn luyện đã tải
-        X_train_np, X_val_np, y_train_np, y_val_np = train_test_split(
-            all_train_images_np, all_train_masks_np, test_size=0.2, random_state=42 # 20% cho validation
-        )
-
-        # Chuyển đổi dữ liệu huấn luyện và validation sang Tensor và tạo DataLoader
-        X_train_tensor = torch.tensor(X_train_np).permute(0, 3, 1, 2).float()
-        y_train_tensor = torch.tensor(y_train_np).long()
-        X_val_tensor = torch.tensor(X_val_np).permute(0, 3, 1, 2).float()
-        y_val_tensor = torch.tensor(y_val_np).long()
-
-    # Kiểm tra kích thước của các tập dữ liệu sau khi chia
-    if len(X_train_tensor) == 0: raise ValueError("No training samples after split.")
-    if len(X_val_tensor) == 0: print("Warning: Validation set is empty after split.")
-
-    train_dataset = TensorDataset(X_train_tensor, y_train_tensor)
-    val_dataset = TensorDataset(X_val_tensor, y_val_tensor)
-
-    train_dataloader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=2, pin_memory=True if DEVICE.type == 'cuda' else False)
-    val_dataloader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=2, pin_memory=True if DEVICE.type == 'cuda' else False)
-
-    print(f"\nTraining samples: {len(train_dataset)}, Validation samples: {len(val_dataset)}")
-    print("Data loaded and prepared for centralized training.")
-
-    # --- Initialize Model, Criterion, Optimizer ---
-    model = RobustMedVFL_UNet(n_channels=1, n_classes=NUM_CLASSES).to(DEVICE)
-    criterion = CombinedLoss(num_classes=NUM_CLASSES, in_channels_maxwell=1024).to(DEVICE)
-    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
-    # scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=5, factor=0.5) # Tùy chọn
-
-    # --- Centralized Training Loop ---
-    best_val_metric = 0.0 # Hoặc float('inf') nếu loss là metric chính
-
-    for epoch in range(NUM_EPOCHS_CENTRALIZED):
-        print(f"\n--- Epoch {epoch + 1}/{NUM_EPOCHS_CENTRALIZED} ---")
-        
-        # Training phase
-        model.train()
-        epoch_train_loss = 0.0
-        num_train_batches = 0
-        
-        for images, targets in train_dataloader:
-            images, targets = images.to(DEVICE), targets.to(DEVICE)
-            
-            images_noisy = quantum_noise_injection(images) # Tùy chọn áp dụng noise
-            
-            optimizer.zero_grad()
-            logits, all_eps_sigma_tuples = model(images_noisy)
-            b1_map_placeholder = torch.randn_like(images[:, 0:1, ...], device=DEVICE) # Placeholder
-            
-            loss = criterion(logits, targets, b1_map_placeholder, all_eps_sigma_tuples) #, features_for_smoothness=None)
-            
-            loss.backward()
-            optimizer.step()
-            
-            epoch_train_loss += loss.item()
-            num_train_batches += 1
-        
-        avg_train_loss = epoch_train_loss / num_train_batches if num_train_batches > 0 else 0
-        print(f"  Epoch {epoch+1} - Training Loss: {avg_train_loss:.4f}")
-        
-        # Validation phase
-        if val_dataloader.dataset and len(val_dataloader.dataset) > 0:
-            print("  Evaluating on validation set...")
-            val_metrics = evaluate_metrics(model, val_dataloader, DEVICE, NUM_CLASSES)
-            # Sử dụng Dice score của class foreground trung bình làm metric chính để so sánh
-            # Lấy các giá trị foreground (class từ 1 trở đi)
-            fg_dice = val_metrics['dice_scores'][1:] if NUM_CLASSES > 1 else [val_metrics['dice_scores'][0]]
-            fg_iou = val_metrics['iou'][1:] if NUM_CLASSES > 1 else [val_metrics['iou'][0]]
-            fg_precision = val_metrics['precision'][1:] if NUM_CLASSES > 1 else [val_metrics['precision'][0]]
-            fg_recall = val_metrics['recall'][1:] if NUM_CLASSES > 1 else [val_metrics['recall'][0]]
-            fg_f1 = val_metrics['f1_score'][1:] if NUM_CLASSES > 1 else [val_metrics['f1_score'][0]]
-            
-            avg_fg_dice = np.mean(fg_dice)
-            avg_fg_iou = np.mean(fg_iou)
-            avg_fg_precision = np.mean(fg_precision)
-            avg_fg_recall = np.mean(fg_recall)
-            avg_fg_f1 = np.mean(fg_f1)
-            
-            print(f"  Epoch {epoch+1} - Validation (Avg Foreground): "
-                  f"Dice: {avg_fg_dice:.4f}; IoU: {avg_fg_iou:.4f}; "
-                  f"Precision: {avg_fg_precision:.4f}; Recall: {avg_fg_recall:.4f}; F1-score: {avg_fg_f1:.4f}")
-            for c_idx in range(NUM_CLASSES):
-                print(f"    Class {c_idx}: Dice: {val_metrics['dice_scores'][c_idx]:.4f}; "
-                      f"IoU: {val_metrics['iou'][c_idx]:.4f}; "
-                      f"Precision: {val_metrics['precision'][c_idx]:.4f}; "
-                      f"Recall: {val_metrics['recall'][c_idx]:.4f}; "
-                      f"F1-score: {val_metrics['f1_score'][c_idx]:.4f}")
-
-            # Tùy chọn: Lưu model tốt nhất dựa trên val_metric
-            if avg_fg_dice > best_val_metric:
-                best_val_metric = avg_fg_dice
-                # torch.save(model.state_dict(), "best_centralized_model.pth")
-                # print(f"    New best model saved with Val Dice: {best_val_metric:.4f}")
-            
-            # if scheduler: scheduler.step(avg_val_loss_or_metric) # Nếu dùng scheduler
-        else:
-            print("  Validation dataset is empty. Skipping validation.")
-
-    print("\n--- Centralized Training Finished ---")
-
-# --- Evaluate on Test Set ---
-if 'test_dataloader' in locals() and len(test_dataloader.dataset) > 0:
-    print("\n--- Evaluating on Test Set ---")
-    test_metrics = evaluate_metrics(model, test_dataloader, DEVICE, NUM_CLASSES)
-
-    fg_dice = test_metrics['dice_scores'][1:] if NUM_CLASSES > 1 else [test_metrics['dice_scores'][0]]
-    fg_iou = test_metrics['iou'][1:] if NUM_CLASSES > 1 else [test_metrics['iou'][0]]
-    fg_precision = test_metrics['precision'][1:] if NUM_CLASSES > 1 else [test_metrics['precision'][0]]
-    fg_recall = test_metrics['recall'][1:] if NUM_CLASSES > 1 else [test_metrics['recall'][0]]
-    fg_f1 = test_metrics['f1_score'][1:] if NUM_CLASSES > 1 else [test_metrics['f1_score'][0]]
-
-    print(f"  Test (Avg Foreground): "
-          f"Dice: {np.mean(fg_dice):.4f}; IoU: {np.mean(fg_iou):.4f}; "
-          f"Precision: {np.mean(fg_precision):.4f}; Recall: {np.mean(fg_recall):.4f}; "
-          f"F1-score: {np.mean(fg_f1):.4f}")
+    Create unified DataLoader for medical datasets.
     
-    for c_idx in range(NUM_CLASSES):
-        print(f"    Class {c_idx}: "
-              f"Dice: {test_metrics['dice_scores'][c_idx]:.4f}; "
-              f"IoU: {test_metrics['iou'][c_idx]:.4f}; "
-              f"Precision: {test_metrics['precision'][c_idx]:.4f}; "
-              f"Recall: {test_metrics['recall'][c_idx]:.4f}; "
-              f"F1-score: {test_metrics['f1_score'][c_idx]:.4f}")
-else:
-    print("Test dataset not available or empty.")
+    Args:
+        acdc_data_dir: Path to ACDC dataset
+        brats_data_dir: Path to BraTS2020 dataset  
+        dataset_type: Type of dataset to create ("acdc", "brats2020", "combined")
+        batch_size: Batch size
+        shuffle: Whether to shuffle data
+        apply_augmentation: Whether to apply data augmentation
+        preprocessor_config: Preprocessor configuration
+        augmentation_config: Augmentation configuration
+        **kwargs: Additional arguments
+        
+    Returns:
+        DataLoader instance
+    """
+    if not UNIFIED_DATA_AVAILABLE:
+        raise ImportError("Unified data system not available. Please check imports.")
+    
+    # Set default paths if not provided
+    if acdc_data_dir is None:
+        acdc_data_dir = "data/raw/ACDC/database/training"
+    if brats_data_dir is None:
+        brats_data_dir = "data/raw/BraTS2020_training_data/content/data"
+    
+    # Create unified loader
+    loader = UnifiedFederatedLoader(
+        acdc_data_dir=acdc_data_dir,
+        brats_data_dir=brats_data_dir,
+        preprocessor_config=preprocessor_config,
+        augmentation_config=augmentation_config
+    )
+    
+    # Create appropriate DataLoader based on dataset type
+    if dataset_type == "acdc":
+        return loader.create_single_dataset_loader(
+            dataset_type="acdc",
+            batch_size=batch_size,
+            shuffle=shuffle,
+            apply_augmentation=apply_augmentation,
+            **kwargs
+        )
+    elif dataset_type == "brats2020":
+        return loader.create_single_dataset_loader(
+            dataset_type="brats2020", 
+            batch_size=batch_size,
+            shuffle=shuffle,
+            apply_augmentation=apply_augmentation,
+            **kwargs
+        )
+    elif dataset_type == "combined":
+        return loader.create_combined_loader(
+            datasets=["acdc", "brats2020"],
+            batch_size=batch_size,
+            shuffle=shuffle,
+            apply_augmentation=apply_augmentation,
+            **kwargs
+        )
+    else:
+        raise ValueError(f"Unknown dataset_type: {dataset_type}")
+
+
+def setup_model_and_data(
+    model_config: dict = None,
+    data_config: dict = None,
+    training_config: dict = None
+) -> tuple:
+    """
+    Setup model and data for training.
+    
+    Args:
+        model_config: Model configuration
+        data_config: Data configuration  
+        training_config: Training configuration
+        
+    Returns:
+        Tuple of (model, train_loader, criterion, optimizer)
+    """
+    # Default configurations
+    model_config = model_config or {}
+    data_config = data_config or {}
+    training_config = training_config or {}
+    
+    # Create model
+    model = RobustMedVFL_UNet(
+        n_channels=model_config.get('n_channels', 1),
+        n_classes=model_config.get('n_classes', 4)
+    ).to(DEVICE)
+    
+    # Create data loader
+    train_loader = create_unified_data_loader(
+        acdc_data_dir=data_config.get('acdc_data_dir'),
+        brats_data_dir=data_config.get('brats_data_dir'),
+        dataset_type=data_config.get('dataset_type', 'combined'),
+        batch_size=data_config.get('batch_size', 8),
+        shuffle=data_config.get('shuffle', True),
+        apply_augmentation=data_config.get('apply_augmentation', True),
+        preprocessor_config=data_config.get('preprocessor_config'),
+        augmentation_config=data_config.get('augmentation_config')
+    )
+    
+    # Create loss function
+    criterion = CombinedLoss(
+        wc=training_config.get('weight_ce', 0.5),
+        wd=training_config.get('weight_dice', 0.5),
+        wp=training_config.get('weight_physics', 0.1),
+        ws=training_config.get('weight_smoothness', 0.01),
+        num_classes=model_config.get('n_classes', 4)
+    )
+    
+    # Create optimizer
+    optimizer = optim.Adam(
+        model.parameters(),
+        lr=training_config.get('learning_rate', 1e-4),
+        weight_decay=training_config.get('weight_decay', 1e-5)
+    )
+    
+    return model, train_loader, criterion, optimizer
+
+
+def train_single_epoch(
+    model: nn.Module,
+    dataloader: DataLoader,
+    criterion: nn.Module,
+    optimizer: optim.Optimizer,
+    device: torch.device = DEVICE,
+    apply_quantum_noise: bool = True,
+    noise_factor: float = 0.01
+) -> dict:
+    """
+    Train model for a single epoch.
+    
+    Args:
+        model: Model to train
+        dataloader: Training data loader
+        criterion: Loss function
+        optimizer: Optimizer
+        device: Device to use
+        apply_quantum_noise: Whether to apply quantum noise injection
+        noise_factor: Noise factor for quantum noise
+        
+    Returns:
+        Dictionary with training metrics
+    """
+    model.train()
+    total_loss = 0.0
+    num_batches = 0
+    
+    for batch_idx, (images, masks) in enumerate(dataloader):
+        # Move data to device
+        images = images.to(device).float()
+        masks = masks.to(device).long()
+        
+        # Apply quantum noise injection if enabled
+        if apply_quantum_noise:
+            images = quantum_noise_injection(images, T=noise_factor)
+        
+        # Forward pass
+        optimizer.zero_grad()
+        outputs, b1_features = model(images)
+        
+        # Compute loss (simplified - using only CE loss for now)
+        if isinstance(criterion, CombinedLoss):
+            # For CombinedLoss, we need additional physics terms
+            # Simplified version using only CE and Dice
+            loss_ce = nn.CrossEntropyLoss()(outputs, masks)
+            loss_dice = DiceLoss()(outputs, masks)
+            loss = 0.5 * loss_ce + 0.5 * loss_dice
+        else:
+            loss = criterion(outputs, masks)
+        
+        # Backward pass
+        loss.backward()
+        
+        # Gradient clipping
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        
+        optimizer.step()
+        
+        total_loss += loss.item()
+        num_batches += 1
+        
+        # Print progress
+        if batch_idx % 10 == 0:
+            print(f'Batch {batch_idx}/{len(dataloader)}, Loss: {loss.item():.4f}')
+    
+    avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
+    
+    return {
+        'train_loss': avg_loss,
+        'num_batches': num_batches,
+        'total_samples': num_batches * dataloader.batch_size
+    }
+
+
+def evaluate_model(
+    model: nn.Module,
+    dataloader: DataLoader,
+    device: torch.device = DEVICE
+) -> dict:
+    """
+    Evaluate model on validation/test data.
+    
+    Args:
+        model: Model to evaluate
+        dataloader: Evaluation data loader
+        device: Device to use
+        
+    Returns:
+        Dictionary with evaluation metrics
+    """
+    model.eval()
+    total_loss = 0.0
+    correct_predictions = 0
+    total_pixels = 0
+    dice_scores = []
+    
+    criterion = nn.CrossEntropyLoss()
+    
+    with torch.no_grad():
+        for images, masks in dataloader:
+            images = images.to(device).float()
+            masks = masks.to(device).long()
+            
+            # Forward pass
+            outputs, _ = model(images)
+            
+            # Compute loss
+            loss = criterion(outputs, masks)
+            total_loss += loss.item()
+            
+            # Compute accuracy
+            predicted = torch.argmax(outputs, dim=1)
+            correct_predictions += (predicted == masks).sum().item()
+            total_pixels += masks.numel()
+            
+            # Compute Dice score for each sample
+            for i in range(outputs.size(0)):
+                dice = compute_dice_score(
+                    predicted[i:i+1].unsqueeze(1), 
+                    masks[i:i+1].unsqueeze(1),
+                    num_classes=4
+                )
+                dice_scores.append(dice)
+    
+    avg_loss = total_loss / len(dataloader)
+    accuracy = correct_predictions / total_pixels
+    avg_dice = np.mean(dice_scores) if dice_scores else 0.0
+    
+    return {
+        'eval_loss': avg_loss,
+        'accuracy': accuracy,
+        'dice_score': avg_dice,
+        'num_samples': len(dataloader.dataset)
+    }
+
+
+def compute_dice_score(predicted: torch.Tensor, target: torch.Tensor, num_classes: int = 4) -> float:
+    """
+    Compute Dice score for segmentation.
+    
+    Args:
+        predicted: Predicted segmentation
+        target: Ground truth segmentation
+        num_classes: Number of classes
+        
+    Returns:
+        Average Dice score across all classes
+    """
+    dice_scores = []
+    
+    for class_idx in range(num_classes):
+        pred_class = (predicted == class_idx).float()
+        target_class = (target == class_idx).float()
+        
+        intersection = (pred_class * target_class).sum()
+        union = pred_class.sum() + target_class.sum()
+        
+        if union > 0:
+            dice = (2.0 * intersection) / union
+            dice_scores.append(dice.item())
+    
+    return np.mean(dice_scores) if dice_scores else 0.0
+
+
+def create_federated_client_data(
+    client_id: int,
+    num_clients: int = 3,
+    acdc_data_dir: str = None,
+    brats_data_dir: str = None,
+    partition_strategy: str = "iid",
+    batch_size: int = 8,
+    **kwargs
+) -> DataLoader:
+    """
+    Create federated data loader for a specific client.
+    
+    Args:
+        client_id: Client ID (0-based)
+        num_clients: Total number of clients
+        acdc_data_dir: Path to ACDC dataset
+        brats_data_dir: Path to BraTS2020 dataset
+        partition_strategy: Partitioning strategy ("iid" or "non_iid")
+        batch_size: Batch size
+        **kwargs: Additional arguments
+        
+    Returns:
+        DataLoader for the specific client
+    """
+    if not UNIFIED_DATA_AVAILABLE:
+        raise ImportError("Unified data system not available for federated learning.")
+    
+    # Create unified loader
+    loader = UnifiedFederatedLoader(
+        acdc_data_dir=acdc_data_dir,
+        brats_data_dir=brats_data_dir
+    )
+    
+    # Create federated loaders
+    federated_loaders = loader.create_federated_loaders(
+        num_clients=num_clients,
+        datasets=["acdc", "brats2020"] if acdc_data_dir and brats_data_dir else None,
+        partition_strategy=partition_strategy,
+        batch_size=batch_size,
+        **kwargs
+    )
+    
+    if client_id >= len(federated_loaders):
+        raise ValueError(f"Client ID {client_id} exceeds available clients {len(federated_loaders)}")
+    
+    return federated_loaders[client_id]
+
+
+# ===========================================
+# TRAINING PIPELINE EXAMPLE
+# ===========================================
+
+def run_training_example():
+    """
+    Example of how to use the integrated data-model system.
+    """
+    print("🚀 Starting Medical Federated Learning Training Example")
+    
+    # Configuration
+    model_config = {
+        'n_channels': 1,
+        'n_classes': 4
+    }
+    
+    data_config = {
+        'dataset_type': 'combined',  # Use both ACDC and BraTS2020
+        'batch_size': 4,
+        'apply_augmentation': True,
+        'preprocessor_config': {
+            'target_size': (256, 256),
+            'normalize': True
+        },
+        'augmentation_config': {
+            'rotation_range': 15.0,
+            'horizontal_flip': True
+        }
+    }
+    
+    training_config = {
+        'learning_rate': 1e-4,
+        'weight_decay': 1e-5,
+        'num_epochs': 2
+    }
+    
+    try:
+        # Setup model and data
+        model, train_loader, criterion, optimizer = setup_model_and_data(
+            model_config=model_config,
+            data_config=data_config,
+            training_config=training_config
+        )
+        
+        print(f"✅ Model created with {sum(p.numel() for p in model.parameters())} parameters")
+        print(f"✅ Data loader created with {len(train_loader)} batches")
+        
+        # Training loop
+        for epoch in range(training_config['num_epochs']):
+            print(f"\n📈 Epoch {epoch + 1}/{training_config['num_epochs']}")
+            
+            # Train
+            train_metrics = train_single_epoch(
+                model=model,
+                dataloader=train_loader,
+                criterion=criterion,
+                optimizer=optimizer,
+                apply_quantum_noise=True
+            )
+            
+            print(f"   Train Loss: {train_metrics['train_loss']:.4f}")
+            print(f"   Samples: {train_metrics['total_samples']}")
+        
+        print("\n🎉 Training completed successfully!")
+        
+    except Exception as e:
+        print(f"❌ Training failed: {e}")
+        import traceback
+        traceback.print_exc()
+
+
+if __name__ == "__main__":
+    # Run example when script is executed directly
+    run_training_example()

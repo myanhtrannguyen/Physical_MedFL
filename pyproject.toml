@@ -17,20 +17,20 @@ classifiers = [
     "Operating System :: OS Independent",
 ]
 dependencies = [
-    "flwr[simulation]==1.8.0", # Using 1.8.0 as per your request, simulation extra for potential local testing
+    "flwr[simulation]==1.18.0",  # Cập nhật lên 1.18.0
     "torch",
-    "torchvision",  # Added dependency for transforms and other utilities
+    "torchvision",
     "scikit-image",
     "scikit-learn",
     "numpy",
-    "h5py",  # Required by model_and_data_handle.py
-    "nibabel",  # For NIfTI file handling
-    "opencv-python",  # For image processing
-    "pyyaml",  # For configuration files
-    "matplotlib",  # For visualization
-    "seaborn",  # For enhanced plotting
-    "tqdm",  # For progress bars
-    "pandas"  # For data analysis
+    "h5py",
+    "nibabel",
+    "opencv-python",
+    "pyyaml",
+    "matplotlib",
+    "seaborn",
+    "tqdm",
+    "pandas"
 ]
 
 [tool.hatch.build.targets.wheel]

@@ -1,0 +1,44 @@
+# Flower Federated Learning Configuration
+# Compatible with Flower 1.18.0 and Standard FedAdam Strategy
+
+[tool.flwr.app.config]
+# Server Configuration
+num-rounds = 10
+round-timeout = 600
+
+# FedAdam Strategy Parameters
+eta = 0.1           # Server-side learning rate
+eta-l = 0.1         # Client-side learning rate  
+beta-1 = 0.9        # Momentum parameter
+beta-2 = 0.99       # Second moment parameter
+tau = 1e-9          # Adaptability control parameter
+
+# Client Selection
+fraction-fit = 1.0
+fraction-evaluate = 1.0
+min-fit-clients = 1
+min-evaluate-clients = 1
+
+# Medical Domain Adaptations
+noise-adaptation = true
+physics-scheduling = true
+progressive-complexity = true
+
+# Training Configuration
+local-epochs = 5
+batch-size = 8
+test-batch-size = 4
+weight-decay = 1e-5
+
+# Data Configuration
+num-classes = 4
+img-size = 256
+
+# Evaluation
+enable-global-evaluation = true
+
+[tool.flwr.federations]
+default = "local-simulation"
+
+[tool.flwr.federations.local-simulation]
+options.num-supernodes = 2 
