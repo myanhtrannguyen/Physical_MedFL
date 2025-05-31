@@ -37,11 +37,11 @@ try:
         CombinedLoss,
         quantum_noise_injection
     )
-    from src.data.dataset import ACDCDataset
-    from src.data.loader import create_acdc_dataloader, create_dataloader
+    from src.data.dataset import ACDCUnifiedDataset, BraTS2020UnifiedDataset, create_unified_dataset
+    from src.data.research_loader import create_research_dataloader, create_federated_research_loaders
+    from src.data.preprocessing import MedicalImagePreprocessor, DataAugmentation
     from src.utils.seed import set_seed
     from src.utils.logger import setup_federated_logger
-    from src.utils.metrics import evaluate_metrics, compute_class_weights, print_metrics_summary
 except ImportError:
     # Fallback imports for development
     print("Warning: Using fallback imports - some features may be limited")
@@ -67,9 +67,9 @@ except ImportError:
 class ServerConstants:
     """Centralized server configuration management"""
     
-    # FedAdam hyperparameters (aligned with standard implementation)
-    DEFAULT_ETA = 0.1  # Server-side learning rate
-    DEFAULT_ETA_L = 0.1  # Client-side learning rate  
+    # FedAdam hyperparameters (optimized for medical segmentation)
+    DEFAULT_ETA = 0.001  # Reduced server-side learning rate for better convergence
+    DEFAULT_ETA_L = 0.0001  # Reduced client-side learning rate to prevent overshooting
     DEFAULT_BETA_1 = 0.9  # Momentum parameter
     DEFAULT_BETA_2 = 0.99  # Second moment parameter
     DEFAULT_TAU = 1e-9  # Controls algorithm's degree of adaptability
@@ -82,10 +82,10 @@ class ServerConstants:
     MIN_AVAILABLE_CLIENTS = 1
     MAX_CLIENTS_PER_ROUND = 10
     
-    # Training constants
-    DEFAULT_ROUNDS = 10
-    DEFAULT_LOCAL_EPOCHS = 5
-    DEFAULT_BATCH_SIZE = 8
+    # Training constants (optimized for medical data)
+    DEFAULT_ROUNDS = 15  # More rounds with lower LR
+    DEFAULT_LOCAL_EPOCHS = 3  # Fewer local epochs to prevent overfitting
+    DEFAULT_BATCH_SIZE = 4  # Smaller batch size for medical segmentation
     
     # Medical imaging constants
     NUM_CLASSES = 4
@@ -431,8 +431,9 @@ def load_global_test_data(config: Dict[str, Any]) -> Optional[DataLoader]:
             
             # Create test dataloader using ACDC dataset
             try:
-                from src.data.loader import create_acdc_dataloader
-                test_dataloader = create_acdc_dataloader(
+                from src.data.research_loader import create_research_dataloader
+                test_dataloader = create_research_dataloader(
+                    dataset_type="acdc",
                     data_dir=test_data_path,
                     batch_size=config.get('test_batch_size', 4),
                     shuffle=False,
@@ -456,7 +457,7 @@ def load_global_test_data(config: Dict[str, Any]) -> Optional[DataLoader]:
                 return test_dataloader
                 
             except ImportError:
-                print("Warning: create_acdc_dataloader not available - using dummy data")
+                print("Warning: create_research_dataloader not available - using dummy data")
                 return None
         else:
             print(f"Warning: Test data path not found: {test_data_path}")

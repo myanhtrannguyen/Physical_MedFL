@@ -19,6 +19,11 @@ def set_seed(seed: int = 42):
     Args:
         seed: Random seed value
     """
+    # Ensure seed is within valid range (0 to 2^32 - 1)
+    seed = int(seed) % (2**32 - 1)
+    if seed < 0:
+        seed = abs(seed)
+    
     # Python random
     random.seed(seed)
     

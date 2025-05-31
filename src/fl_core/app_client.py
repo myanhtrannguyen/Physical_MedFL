@@ -29,8 +29,8 @@ from flwr.common import Context, Config, NDArrays, Scalar
 # 1.4 Project-Specific Imports
 try:
     from src.models.mlp_model import RobustMedVFL_UNet
-    from src.data.dataset import ACDCDataset, MedicalSegmentationDataset
-    from src.data.loader import create_acdc_dataloader, create_dataloader_from_paths
+    from src.data.dataset import ACDCUnifiedDataset, BraTS2020UnifiedDataset, create_unified_dataset
+    from src.data.research_loader import create_research_dataloader, get_research_client_dataloader
     from src.data.preprocessing import MedicalImagePreprocessor, DataAugmentation
     from src.utils.seed import set_seed
     from src.utils.logger import setup_federated_logger
@@ -73,13 +73,13 @@ except ImportError as e:
         MedicalImagePreprocessor = FallbackMedicalImagePreprocessor
         DataAugmentation = FallbackDataAugmentation
         
-        def create_acdc_dataloader(*args, **kwargs) -> DataLoader:
+        def create_research_dataloader(*args, **kwargs) -> DataLoader:
             """Fallback dataloader creation"""
-            raise NotImplementedError("ACDC dataloader not available without src imports")
+            raise NotImplementedError("Research dataloader not available without src imports")
         
-        def create_dataloader_from_paths(*args, **kwargs) -> DataLoader:
-            """Fallback dataloader creation"""
-            raise NotImplementedError("Dataloader from paths not available without src imports")
+        def get_research_client_dataloader(*args, **kwargs) -> DataLoader:
+            """Fallback client dataloader creation"""
+            raise NotImplementedError("Research client dataloader not available without src imports")
             
     except ImportError:
         logging.error("Could not import RobustMedVFL_UNet from any location")
@@ -180,6 +180,20 @@ NOISE_CONFIG = {
 
 # 3. FLOWERCLIENT CLASS DEFINITION
 
+# Utility functions for model information
+def get_model_info(model):
+    """Get comprehensive information about a PyTorch model."""
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    
+    return {
+        'model_name': model.__class__.__name__,
+        'total_parameters': total_params,
+        'trainable_parameters': trainable_params,
+        'model_size_mb': total_params * 4 / (1024 * 1024),  # Assuming float32
+        'device': next(model.parameters()).device.type if total_params > 0 else 'cpu'
+    }
+
 class FlowerClient(NumPyClient):
     """
     Comprehensive Federated Learning Client with Advanced Medical Imaging Components
@@ -278,6 +292,10 @@ class FlowerClient(NumPyClient):
                 # CRITICAL: Ensure model is in training mode and parameters are trainable
                 self.model.train()
                 
+                # Force all parameters to be trainable
+                for param in self.model.parameters():
+                    param.requires_grad = True
+                
                 # Debug: List all parameters and their requires_grad
                 for name, param in self.model.named_parameters():
                     self.logger.info(f"Param: {name}, shape: {tuple(param.shape)}, requires_grad: {param.requires_grad}")
@@ -321,6 +339,10 @@ class FlowerClient(NumPyClient):
                 
                 # CRITICAL: Ensure model is in training mode and parameters are trainable
                 self.model.train()
+                
+                # Force all parameters to be trainable
+                for param in self.model.parameters():
+                    param.requires_grad = True
                 
                 # Debug: List all parameters and their requires_grad
                 for name, param in self.model.named_parameters():
@@ -412,7 +434,24 @@ class FlowerClient(NumPyClient):
         self.valloader = None
         self.num_examples = {"trainset": 0, "valset": 0}
         
+        # Add missing attributes
+        self.batch_size = self.training_config.get('batch_size', 4)
+        self.criterion = self._create_criterion()
+        
         self.logger.info("Data components initialized")
+    
+    def _create_criterion(self):
+        """Create loss function for training."""
+        try:
+            # Try to use advanced loss if available
+            if ADVANCED_COMPONENTS_AVAILABLE:
+                return CombinedLoss()
+            else:
+                # Use standard CrossEntropyLoss for segmentation
+                return nn.CrossEntropyLoss(ignore_index=255)
+        except Exception as e:
+            self.logger.warning(f"Failed to create advanced loss, using CrossEntropyLoss: {e}")
+            return nn.CrossEntropyLoss(ignore_index=255)
     
     # 3.2 PARAMETER MANAGEMENT METHODS
     
@@ -686,18 +725,16 @@ class FlowerClient(NumPyClient):
         self.logger.info(f"Model adapted for round {self.server_round}")
     
     def _create_combined_loss(self):
-        """Create combined loss function with all components."""
+        """Create improved loss function for federated learning convergence."""
         try:
-            if ADVANCED_COMPONENTS_AVAILABLE:
-                return CombinedLoss(
-                    num_classes=self.model_config["n_classes"],
-                    device=self.device
-                )
-            else:
-                # Fallback to standard loss
-                return nn.CrossEntropyLoss()
+            # Use standard loss functions with class weights for medical segmentation
+            class_weights = torch.tensor([0.1, 2.0, 3.0, 2.5]).to(self.device)  # [background, RV, myocardium, LV]
+            
+            # Use weighted CrossEntropy for handling class imbalance
+            return nn.CrossEntropyLoss(weight=class_weights)
+            
         except Exception as e:
-            self.logger.warning(f"Failed to create combined loss: {e}, using CrossEntropyLoss")
+            self.logger.error(f"Error creating improved loss: {e}")
             return nn.CrossEntropyLoss()
     
     def _execute_training_loop(self, config: Config) -> Dict[str, Any]:
@@ -938,6 +975,9 @@ class FlowerClient(NumPyClient):
         try:
             # Convert to binary for each class and compute Dice
             dice_scores = []
+            total_dice = 0.0
+            valid_classes = 0
+            
             for class_id in range(self.model_config["n_classes"]):
                 pred_class = (predicted == class_id).float()
                 target_class = (target == class_id).float()
@@ -948,9 +988,29 @@ class FlowerClient(NumPyClient):
                 if union > 0:
                     dice = (2.0 * intersection) / union
                     dice_scores.append(dice.item())
+                    total_dice += dice.item()
+                    valid_classes += 1
+                    
+                    # Debug: Log per-class dice scores
+                    if class_id == 0:  # Log background occasionally
+                        self.logger.debug(f"Class {class_id} Dice: {dice.item():.4f}")
+                else:
+                    dice_scores.append(0.0)
             
-            return float(np.mean(dice_scores)) if dice_scores else 0.0
-        except Exception:
+            avg_dice = total_dice / valid_classes if valid_classes > 0 else 0.0
+            
+            # Additional debugging
+            if avg_dice < 0.4:  # If dice is stuck around 0.3
+                self.logger.warning(f"Low Dice score detected: {avg_dice:.4f}")
+                self.logger.warning(f"Per-class Dice: {[f'{d:.3f}' for d in dice_scores]}")
+                unique_pred = torch.unique(predicted)
+                unique_target = torch.unique(target)
+                self.logger.warning(f"Predicted classes: {unique_pred.tolist()}")
+                self.logger.warning(f"Target classes: {unique_target.tolist()}")
+            
+            return float(avg_dice)
+        except Exception as e:
+            self.logger.error(f"Error computing Dice score: {e}")
             return 0.0
     
     def _compute_iou_score(self, predicted: torch.Tensor, target: torch.Tensor) -> float:
@@ -1231,100 +1291,53 @@ class FlowerClient(NumPyClient):
                 self._create_minimal_dummy_data()
                 return
             
-            # Try to load ACDC dataset
+            # Create client dataset (simplified approach)
+            # Use research dataloader with fallback to BraTS if available
             try:
-                self.logger.info("Attempting to create ACDC dataloader...")
-                # Create ACDC dataloader
-                self.trainloader = create_acdc_dataloader(
+                self.trainloader = create_research_dataloader(
+                    dataset_type="brats2020",
                     data_dir=str(self.data_path),
-                    batch_size=self.batch_size,
-                    shuffle=True,
-                    augment=True,
-                    num_workers=0
-                )
-                
-                # Create validation loader (subset of training data)
-                self.valloader = create_acdc_dataloader(
-                    data_dir=str(self.data_path),
-                    batch_size=self.batch_size,
-                    shuffle=False,
-                    augment=False,
-                    num_workers=0
-                )
-                
-                # Count examples
-                self.num_examples["trainset"] = len(self.trainloader.dataset)  # type: ignore
-                self.num_examples["valset"] = len(self.valloader.dataset)  # type: ignore
-                
-                self.logger.info(f"Loaded ACDC data: {self.num_examples['trainset']} train, "
-                               f"{self.num_examples['valset']} val samples")
-                
-            except Exception as e:
-                self.logger.warning(f"Failed to load ACDC data: {e}")
-                # Try alternative data loading
-                try:
-                    self._load_alternative_data()
-                except Exception as e2:
-                    self.logger.warning(f"Alternative data loading also failed: {e2}")
-                    self._create_minimal_dummy_data()
-                
-        except Exception as e:
-            self.logger.error(f"Failed to load client data: {e}")
-            # Create minimal dummy data for testing
-            self._create_minimal_dummy_data()
-    
-    def _load_alternative_data(self):
-        """Load data using alternative methods."""
-        try:
-            # Look for image files in the directory
-            image_files = []
-            mask_files = []
-            
-            for ext in ['.nii', '.nii.gz']:
-                image_files.extend(list(self.data_path.rglob(f'*{ext}')))
-            
-            # Filter out ground truth files
-            image_files = [f for f in image_files if '_gt' not in f.name]
-            
-            # Find corresponding mask files
-            for img_file in image_files:
-                mask_file = img_file.parent / f"{img_file.stem}_gt{img_file.suffix}"
-                if mask_file.exists():
-                    mask_files.append(str(mask_file))
-                else:
-                    mask_files.append(None)
-            
-            if image_files:
-                # Create dataloaders from file paths
-                image_paths = [str(f) for f in image_files]
-                
-                self.trainloader = create_dataloader_from_paths(
-                    image_paths=image_paths,
-                    mask_paths=mask_files,
                     batch_size=self.batch_size,
                     shuffle=True,
                     augment=True
                 )
                 
-                self.valloader = create_dataloader_from_paths(
-                    image_paths=image_paths[:len(image_paths)//5],  # Use 20% for validation
-                    mask_paths=mask_files[:len(mask_files)//5] if mask_files else None,
+                self.valloader = create_research_dataloader(
+                    dataset_type="brats2020", 
+                    data_dir=str(self.data_path),
                     batch_size=self.batch_size,
                     shuffle=False,
                     augment=False
                 )
+            except Exception:
+                # If BraTS doesn't work, try ACDC as fallback
+                self.trainloader = create_research_dataloader(
+                    dataset_type="acdc",
+                    data_dir=str(self.data_path),
+                    batch_size=self.batch_size,
+                    shuffle=True,
+                    augment=True
+                )
                 
-                self.num_examples["trainset"] = len(image_paths)
-                self.num_examples["valset"] = len(image_paths) // 5
-                
-                self.logger.info(f"Loaded alternative data: {self.num_examples['trainset']} train, "
-                               f"{self.num_examples['valset']} val samples")
-            else:
-                raise ValueError("No image files found")
-                
+                self.valloader = create_research_dataloader(
+                    dataset_type="acdc",
+                    data_dir=str(self.data_path), 
+                    batch_size=self.batch_size,
+                    shuffle=False,
+                    augment=False
+                )
+            
+            # Count examples
+            self.num_examples["trainset"] = len(self.trainloader.dataset)  # type: ignore
+            self.num_examples["valset"] = len(self.valloader.dataset)  # type: ignore
+            
+            self.logger.info(f"Loaded data: {self.num_examples['trainset']} train, "
+                           f"{self.num_examples['valset']} val samples")
+            
         except Exception as e:
-            self.logger.error(f"Alternative data loading failed: {e}")
-            raise
+            self.logger.error(f"Failed to load client data: {e}")
+            # Create minimal dummy data for testing
+            self._create_minimal_dummy_data()
     
     def _create_minimal_dummy_data(self):
         """Create minimal dummy data for testing purposes."""

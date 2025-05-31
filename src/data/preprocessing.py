@@ -22,24 +22,30 @@ class MedicalImagePreprocessor:
         self,
         target_size: Tuple[int, int] = (256, 256),
         normalize: bool = True,
-        clip_percentiles: Tuple[float, float] = (1, 99),
-        apply_clahe: bool = True
-    ):
+        clip_percentiles: Optional[Tuple[float, float]] = (1, 99),
+        apply_clahe: bool = True,
+        memory_efficient: bool = True,
+        dtype: str = 'float32'
+    ) -> None:
         """
-        Initialize the preprocessor.
+        Initialize medical image preprocessor.
         
         Args:
             target_size: Target image size (height, width)
-            normalize: Whether to normalize images to [0, 1]
+            normalize: Whether to normalize to [0, 1]
             clip_percentiles: Percentiles for intensity clipping
-            apply_clahe: Whether to apply CLAHE for contrast enhancement
+            apply_clahe: Whether to apply CLAHE
+            memory_efficient: Whether to use memory-efficient operations
+            dtype: Output data type for memory optimization
         """
         self.target_size = target_size
         self.normalize = normalize
         self.clip_percentiles = clip_percentiles
         self.apply_clahe = apply_clahe
+        self.memory_efficient = memory_efficient
+        self.dtype = getattr(np, dtype)
         
-        # CLAHE for contrast enhancement
+        # Initialize CLAHE
         self.clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     
     def preprocess_image(self, image: np.ndarray) -> np.ndarray:

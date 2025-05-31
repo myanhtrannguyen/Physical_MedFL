@@ -81,27 +81,29 @@ training:
   
   # Optimization
   optimizer: "adam"
-  learning_rate: 0.001
+  learning_rate: 0.0001
   weight_decay: 0.0001
   
   # Learning rate scheduling
   scheduler:
-    type: "step"  # Options: step, cosine, plateau
+    type: "plateau"
     step_size: 5
     gamma: 0.5
+    patience: 3
+    factor: 0.5
   
   # Loss function
   loss:
-    type: "combined"  # Options: dice, focal, combined
-    dice_weight: 0.5
-    focal_weight: 0.5
+    type: "dice"
+    dice_weight: 1.0
+    focal_weight: 0.0
     focal_alpha: 0.25
     focal_gamma: 2.0
   
   # Early stopping
   early_stopping:
-    patience: 5
-    min_delta: 0.001
+    patience: 10
+    min_delta: 0.0001
     monitor: "val_dice"
 
 # Evaluation configuration

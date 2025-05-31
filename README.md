@@ -1,6 +1,141 @@
 # Federated Learning for Medical Image Segmentation
 
-A comprehensive federated learning framework for medical image segmentation using the ACDC (Automated Cardiac Diagnosis Challenge) dataset. This project implements robust federated learning with support for multiple model architectures and data partitioning strategies.
+This project implements a federated learning system for medical image segmentation, primarily designed for datasets like ACDC (cardiac) and BraTS 2020 (brain tumor). It utilizes the Flower framework for federated learning orchestration.
+
+## Prerequisites
+
+*   Python 3.10 or newer
+*   Pip (Python package installer)
+*   Git (for cloning the repository)
+
+## Setup Instructions
+
+1.  **Clone the Repository:**
+    ```bash
+    git clone <your_repository_url>
+    cd <repository_directory_name> 
+    ```
+    *(Replace `<your_repository_url>` with the actual URL of your Git repository and `<repository_directory_name>` with the name of the cloned folder, e.g., `Federated_Learning`)*
+
+2.  **Create and Activate a Virtual Environment (Recommended):**
+    ```bash
+    python3 -m venv .venv_py310
+    source .venv_py310/bin/activate
+    ```
+    *(On Windows, use `.venv_py310\Scripts\activate` to activate)*
+
+3.  **Install Dependencies:**
+    This project uses `pyproject.toml` to manage dependencies. Install them using:
+    ```bash
+    pip install .
+    ```
+    This command will install all necessary packages, including Flower, PyTorch, Nibabel, etc., as defined in `pyproject.toml`.
+
+4.  **Download Datasets:**
+    The system is designed to work with data organized as follows. Create these directories if they don't exist:
+
+    *   **ACDC Dataset:**
+        *   Download the ACDC dataset (e.g., from [ACDC Challenge website](https://www.creatis.insa-lyon.fr/Challenge/acdc/)).
+        *   Extract and place the training data (patient folders) into `data/raw/ACDC/training/`. The expected structure is:
+            ```
+            Federated_Learning/
+            └── data/
+                └── raw/
+                    └── ACDC/
+                        └── training/
+                            ├── patient001/
+                            │   ├── patient001_frame01.nii.gz
+                            │   ├── patient001_frame01_gt.nii.gz
+                            │   └── ... (other frames and patient info files)
+                            ├── patient002/
+                            │   └── ...
+                            └── ...
+            ```
+    *   **BraTS 2020 Dataset (Preprocessed H5 files):**
+        *   If you are using BraTS 2020 data preprocessed into H5 files (each file representing a 2D slice with multiple modalities and a mask), place them into `data/raw/BraTS2020_training_data/content/data/`.
+        *   The dataset loader expects H5 files named in a pattern like `volume_<VOL_ID>_slice_<SLICE_ID>.h5`.
+            ```
+            Federated_Learning/
+            └── data/
+                └── raw/
+                    └── BraTS2020_training_data/
+                        └── content/
+                            └── data/
+                                ├── volume_0_slice_75.h5
+                                ├── volume_0_slice_76.h5
+                                └── ...
+            ```
+    *(Note: The exact paths used by the scripts to find these datasets are typically configured within your main simulation script, where `base_data_dirs` is passed to `get_client_dataloader_direct` in `src/data/flower_utils.py`.)*
+
+5.  **Configuration:**
+    *   Federated learning strategy parameters (e.g., number of rounds, FedAdam parameters) are in `config.toml`.
+    *   The number of clients, dataset types per client, and specific dataset arguments (like `frames` for ACDC or `slice_range` for BraTS) are usually set in your main Python script that launches the Flower simulation. This script will use `src/data/flower_utils.py` to prepare data for each client.
+
+## Running the Federated Learning Simulation
+
+1.  **Activate the Virtual Environment (if not already active):**
+    ```bash
+    source .venv_py310/bin/activate
+    ```
+
+2.  **Run the Main Simulation Script:**
+    You will need a Python script to define the Flower simulation, configure clients, and start the server. Let's assume you have a script like `src/run_federated_simulation.py` ( **Please create or identify your actual main script** ).
+
+    Example of how you might run it:
+    ```bash
+    python src/run_federated_simulation.py
+    ```
+    This script should:
+    *   Define `TOTAL_NUM_CLIENTS`.
+    *   For each client:
+        *   Determine which datasets (`dataset_types_for_client`) it should use.
+        *   Define `base_data_dirs` pointing to your `data/raw/ACDC/training` and `data/raw/BraTS2020_training_data/content/data` (or wherever you placed them).
+        *   Instantiate `MedicalImagePreprocessor` and `DataAugmentation`.
+        *   Call `get_client_dataloader_direct` from `src/data/flower_utils.py` to get the client's DataLoader.
+        *   Define a Flower `NumPyClient` or `Client` that uses this DataLoader for training and evaluation.
+    *   Start the Flower simulation using `fl.simulation.start_simulation()`.
+
+    Logs and results will typically be saved to the `logs/` directory.
+
+## Project Structure Overview
+
+```
+Federated_Learning/
+├── .venv_py310/            # Python virtual environment
+├── config.toml             # Flower strategy configuration
+├── data/
+│   └── raw/                # Root for raw ACDC and BraTS datasets
+├── logs/                   # Directory for experiment outputs (models, metrics)
+├── src/
+│   ├── data/               # Data loading, preprocessing, augmentation, dataset classes, Flower data utilities
+│   │   ├── dataset.py
+│   │   └── flower_utils.py
+│   ├── models/             # Segmentation model definitions (e.g., UNet)
+│   ├── experiment/         # Training, evaluation, and experiment logic
+│   ├── utils/              # Common utility functions
+│   └── run_federated_simulation.py # EXAMPLE: Your main script to start Flower (you need to create/identify this)
+├── .gitignore
+├── LICENSE
+├── pyproject.toml          # Defines project dependencies and metadata
+└── README.md               # This file
+```
+
+## Customization
+
+*   **Federated Strategy:** Modify `config.toml` and the strategy definition in your main simulation script.
+*   **Number of Clients/Rounds:** Adjust in `config.toml` and your main simulation script.
+*   **Model Architecture:** Modify or add models in `src/models/`.
+*   **Data Augmentation/Preprocessing:** Configure `MedicalImagePreprocessor` and `DataAugmentation` instances passed to data loaders in `src/data/`.
+*   **Client Data Distribution:** The logic in `src/data/dataset.py` (specifically in `ACDCUnifiedDataset` and `BraTS2020UnifiedDataset`) handles how data is split among clients based on `client_id` and `total_num_clients`. This is utilized by `get_client_dataloader_direct` in `src/data/flower_utils.py`.
+
+## Troubleshooting
+
+*   **`ModuleNotFoundError`:** Ensure your virtual environment is active and you've run `pip install .` successfully. If importing local modules from `src` (e.g., `from src.data import ...`), make sure Python's path recognizes the `src` directory or run your main script from the project root.
+*   **Data Loading Issues (`FileNotFoundError`, empty datasets):**
+    *   Verify that the dataset paths in `base_data_dirs` within your main simulation script accurately point to the locations of your ACDC and BraTS data.
+    *   Check that the file and directory structure within your `data/raw/` matches the expectations outlined in the "Download Datasets" section.
+    *   Look for warnings from `logger` in the console output, which might indicate issues finding or assigning data to clients.
+*   **PyTorch/CUDA Errors:** If using a GPU, confirm that PyTorch was installed with CUDA support and that your NVIDIA drivers are compatible. `pin_memory=torch.cuda.is_available()` in `get_client_dataloader_direct` helps with GPU performance.
 
 ## 🏗️ Project Structure
 
