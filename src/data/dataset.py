@@ -369,18 +369,16 @@ class BraTS2020UnifiedDataset(BaseUnifiedDataset):
         
         for h5_file in files_to_process:
             # _process_h5_file now implicitly uses self.slice_range if set
-            self._process_h5_file(h5_file) 
+            self._process_h5_file(h5_file)
         
         # Sort by volume and slice ID (if data_paths were populated)
         if self.data_paths:
             self.data_paths.sort(key=lambda x: (x.get('volume_id', -1), x.get('slice_id', -1)))
         
         logger.info(f"BraTS2020 dataset initialized for client {self.client_id if self.client_id is not None else 'all'}: {len(self.data_paths)} samples")
-
+    
     def _process_h5_file(self, h5_file: Path) -> None:
         """Process a single H5 file, considering self.slice_range."""
-        # This method is now called with pre-filtered files if client_id is used.
-        # It still needs to respect self.slice_range for the files it does process.
         try:
             parts = h5_file.stem.split('_')
             if len(parts) >= 4 and parts[0] == 'volume' and parts[2] == 'slice':
@@ -393,10 +391,7 @@ class BraTS2020UnifiedDataset(BaseUnifiedDataset):
                     if not (min_slice <= slice_id <= max_slice):
                         return # Skip this slice if it's outside the range
                 
-                # If self.specified_volume_ids is used, we already filtered by volume_id.
-                # If client_id partitioning is used, files are already client-specific.
-                # If no filters, we process all.
-                # So, we just append if it passes slice_range.
+                # Add to data paths if it passes all filters
                 self.data_paths.append({
                     'file': str(h5_file),
                     'volume_id': volume_id,
@@ -408,10 +403,7 @@ class BraTS2020UnifiedDataset(BaseUnifiedDataset):
     
     def _should_include_file(self, volume_id: int, slice_id: int) -> bool:
         """
-        DEPRECATED or REPURPOSED: This method's logic is now largely incorporated
-        into _initialize_dataset and _process_h5_file for client-based partitioning
-        and initial volume_id/slice_range filtering.
-        If called directly, it assumes no client partitioning.
+        DEPRECATED: This method's logic is now incorporated into _initialize_dataset and _process_h5_file.
         """
         # Filter by volume IDs (if specified_volume_ids is being used AND no client partitioning)
         if self.specified_volume_ids and self.client_id is None:
@@ -478,192 +470,6 @@ class BraTS2020UnifiedDataset(BaseUnifiedDataset):
         return ['Background', 'Enhancing Tumor', 'Tumor Core', 'Whole Tumor']
 
 
-class UnifiedDatasetManager:
-    """Manager for creating and combining multiple datasets."""
-    
-    def __init__(self) -> None:
-        """Initialize dataset manager."""
-        self.datasets: Dict[str, BaseUnifiedDataset] = {}
-        self.dataset_configs: Dict[str, Dict[str, Any]] = {}
-    
-    def register_dataset(
-        self,
-        name: str,
-        dataset_type: DatasetType,
-        data_dir: str,
-        config: Optional[Dict[str, Any]] = None
-    ) -> None:
-        """
-        Register a dataset configuration.
-        
-        Args:
-            name: Dataset name/identifier
-            dataset_type: Type of dataset ('acdc' or 'brats2020')
-            data_dir: Path to dataset directory
-            config: Additional configuration parameters
-        """
-        self.dataset_configs[name] = {
-            'type': dataset_type,
-            'data_dir': data_dir,
-            'config': config or {}
-        }
-        logger.info(f"Registered dataset '{name}' of type '{dataset_type}'")
-    
-    def create_dataset(
-        self,
-        name: str,
-        preprocessor: Optional[MedicalImagePreprocessor] = None,
-        augmentation: Optional[DataAugmentation] = None,
-        client_id: Optional[int] = None,
-        total_num_clients: Optional[int] = None,
-        **kwargs
-    ) -> BaseUnifiedDataset:
-        """
-        Create a dataset instance.
-        
-        Args:
-            name: Registered dataset name
-            preprocessor: Image preprocessor
-            augmentation: Data augmentation
-            client_id: Optional client ID for data partitioning.
-            total_num_clients: Optional total number of clients for partitioning.
-            **kwargs: Additional arguments
-            
-        Returns:
-            Dataset instance
-        """
-        if name not in self.dataset_configs:
-            raise ValueError(f"Dataset '{name}' not registered")
-        
-        config = self.dataset_configs[name]
-        dataset_config = {**config['config'], **kwargs}
-        
-        # Add client_id and total_num_clients to dataset_specific_kwargs
-        # These will be passed to ACDCUnifiedDataset or BraTS2020UnifiedDataset constructor
-        dataset_specific_kwargs = dataset_config.copy()
-        if client_id is not None:
-            dataset_specific_kwargs['client_id'] = client_id
-        if total_num_clients is not None:
-            dataset_specific_kwargs['total_num_clients'] = total_num_clients
-        
-        if config['type'] == 'acdc':
-            dataset = ACDCUnifiedDataset(
-                data_dir=config['data_dir'],
-                preprocessor=preprocessor,
-                augmentation=augmentation,
-                **dataset_specific_kwargs
-            )
-        elif config['type'] == 'brats2020':
-            dataset = BraTS2020UnifiedDataset(
-                data_dir=config['data_dir'],
-                preprocessor=preprocessor,
-                augmentation=augmentation,
-                **dataset_specific_kwargs
-            )
-        else:
-            raise ValueError(f"Unknown dataset type: {config['type']}")
-        
-        self.datasets[name] = dataset
-        return dataset
-    
-    def create_combined_dataset(
-        self,
-        dataset_names: List[str],
-        preprocessor: Optional[MedicalImagePreprocessor] = None,
-        augmentation: Optional[DataAugmentation] = None,
-        **kwargs
-    ) -> ConcatDataset:
-        """
-        Create a combined dataset from multiple registered datasets.
-        
-        Args:
-            dataset_names: List of dataset names to combine
-            preprocessor: Shared preprocessor
-            augmentation: Shared augmentation
-            **kwargs: Additional arguments
-            
-        Returns:
-            Combined dataset
-        """
-        datasets: List[BaseUnifiedDataset] = []
-        for name in dataset_names:
-            dataset = self.create_dataset(
-                name=name,
-                preprocessor=preprocessor,
-                augmentation=augmentation,
-                **kwargs
-            )
-            datasets.append(dataset)
-        
-        combined = ConcatDataset(datasets)
-        logger.info(f"Created combined dataset with {len(combined)} total samples")
-        return combined
-    
-    def get_dataset_info(self, name: str) -> Dict[str, Any]:
-        """
-        Get information about a registered dataset.
-        
-        Args:
-            name: Dataset name
-            
-        Returns:
-            Dictionary with dataset information
-        """
-        if name in self.datasets:
-            dataset = self.datasets[name]
-            return {
-                'name': name,
-                'type': self.dataset_configs[name]['type'],
-                'size': len(dataset),
-                'num_classes': dataset.get_num_classes(),
-                'class_names': dataset.get_class_names(),
-                'data_dir': str(dataset.data_dir)
-            }
-        elif name in self.dataset_configs:
-            return {
-                'name': name,
-                'type': self.dataset_configs[name]['type'],
-                'data_dir': self.dataset_configs[name]['data_dir'],
-                'status': 'registered_not_created'
-            }
-        else:
-            return {'error': f"Dataset '{name}' not found"}
-    
-    def list_datasets(self) -> Dict[str, Dict[str, Any]]:
-        """
-        List all registered datasets and their info.
-        
-        Returns:
-            Dictionary mapping dataset names to their information
-        """
-        info: Dict[str, Dict[str, Any]] = {}
-        for name in self.dataset_configs:
-            info[name] = self.get_dataset_info(name)
-        return info
-    
-    def save_config(self, filepath: str) -> None:
-        """
-        Save dataset configurations to file.
-        
-        Args:
-            filepath: Path to save configuration file
-        """
-        with open(filepath, 'w') as f:
-            json.dump(self.dataset_configs, f, indent=2)
-        logger.info(f"Dataset configurations saved to {filepath}")
-    
-    def load_config(self, filepath: str) -> None:
-        """
-        Load dataset configurations from file.
-        
-        Args:
-            filepath: Path to configuration file
-        """
-        with open(filepath, 'r') as f:
-            self.dataset_configs = json.load(f)
-        logger.info(f"Dataset configurations loaded from {filepath}")
-
-
 # Convenience functions
 def create_unified_dataset(
     dataset_type: DatasetType,
@@ -689,12 +495,7 @@ def create_unified_dataset(
     Returns:
         Dataset instance
     """
-    # Pass client_id and total_num_clients to the specific dataset constructors
-    # Ensure these are popped from kwargs if they are not meant for the superclass or other logic
-    # or ensure the dataset constructors handle them appropriately.
-    
     # Add client_id and total_num_clients to dataset_specific_kwargs
-    # These will be passed to ACDCUnifiedDataset or BraTS2020UnifiedDataset constructor
     dataset_specific_kwargs = kwargs.copy()
     if client_id is not None:
         dataset_specific_kwargs['client_id'] = client_id
@@ -716,46 +517,4 @@ def create_unified_dataset(
             **dataset_specific_kwargs
         )
     else:
-        raise ValueError(f"Unknown dataset type: {dataset_type}")
-
-
-def create_multi_dataset_loader(
-    datasets_config: List[Dict[str, Any]],
-    batch_size: int = 8,
-    shuffle: bool = True,
-    num_workers: int = 0,
-    **dataloader_kwargs
-) -> DataLoader:
-    """
-    Create a DataLoader that combines multiple datasets.
-    
-    Args:
-        datasets_config: List of dataset configurations
-        batch_size: Batch size
-        shuffle: Whether to shuffle
-        num_workers: Number of worker processes
-        **dataloader_kwargs: Additional DataLoader arguments
-        
-    Returns:
-        DataLoader instance
-    """
-    # Create datasets
-    datasets: List[BaseUnifiedDataset] = []
-    for config in datasets_config:
-        dataset = create_unified_dataset(**config)
-        datasets.append(dataset)
-    
-    # Combine datasets
-    combined_dataset = ConcatDataset(datasets)
-    
-    # Create DataLoader
-    dataloader = DataLoader(
-        combined_dataset,
-        batch_size=batch_size,
-        shuffle=shuffle,
-        num_workers=num_workers,
-        **dataloader_kwargs
-    )
-    
-    logger.info(f"Created multi-dataset DataLoader with {len(combined_dataset)} samples")
-    return dataloader 
+        raise ValueError(f"Unknown dataset type: {dataset_type}") 

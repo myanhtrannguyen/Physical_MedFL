@@ -8,14 +8,13 @@ import os
 from skimage.transform import resize
 from torch.utils.data import TensorDataset, DataLoader
 from sklearn.model_selection import train_test_split
+from typing import Optional, Dict, Any
 
 # Import unified data system
 try:
     from src.data import (
-        UnifiedFederatedLoader,
-        create_acdc_loader,
-        create_brats_loader,
-        create_multi_medical_loader,
+        create_research_dataloader,
+        create_federated_research_loaders,
         ACDCUnifiedDataset,
         BraTS2020UnifiedDataset,
         MedicalImagePreprocessor,
@@ -28,10 +27,8 @@ except ImportError:
         import sys
         sys.path.append('.')
         from src.data import (
-            UnifiedFederatedLoader,
-            create_acdc_loader,
-            create_brats_loader,
-            create_multi_medical_loader,
+            create_research_dataloader,
+            create_federated_research_loaders,
             ACDCUnifiedDataset,
             BraTS2020UnifiedDataset,
             MedicalImagePreprocessor,
@@ -366,14 +363,14 @@ class CombinedLoss(nn.Module):
 # ===========================================
 
 def create_unified_data_loader(
-    acdc_data_dir: str = None,
-    brats_data_dir: str = None,
+    acdc_data_dir: Optional[str] = None,
+    brats_data_dir: Optional[str] = None,
     dataset_type: str = "combined",  # "acdc", "brats2020", "combined"
     batch_size: int = 8,
     shuffle: bool = True,
     apply_augmentation: bool = True,
-    preprocessor_config: dict = None,
-    augmentation_config: dict = None,
+    preprocessor_config: Optional[Dict[str, Any]] = None,
+    augmentation_config: Optional[Dict[str, Any]] = None,
     **kwargs
 ) -> DataLoader:
     """
@@ -402,41 +399,41 @@ def create_unified_data_loader(
     if brats_data_dir is None:
         brats_data_dir = "data/raw/BraTS2020_training_data/content/data"
     
-    # Create unified loader
-    loader = UnifiedFederatedLoader(
-        acdc_data_dir=acdc_data_dir,
-        brats_data_dir=brats_data_dir,
-        preprocessor_config=preprocessor_config,
-        augmentation_config=augmentation_config
-    )
-    
-    # Create appropriate DataLoader based on dataset type
+    # Use research loader functions directly
     if dataset_type == "acdc":
-        return loader.create_single_dataset_loader(
+        return create_research_dataloader(
             dataset_type="acdc",
+            data_dir=acdc_data_dir,
             batch_size=batch_size,
             shuffle=shuffle,
-            apply_augmentation=apply_augmentation,
+            augment=apply_augmentation,
+            preprocessor_config=preprocessor_config,
+            augmentation_config=augmentation_config,
             **kwargs
         )
     elif dataset_type == "brats2020":
-        return loader.create_single_dataset_loader(
-            dataset_type="brats2020", 
+        return create_research_dataloader(
+            dataset_type="brats2020",
+            data_dir=brats_data_dir,
             batch_size=batch_size,
             shuffle=shuffle,
-            apply_augmentation=apply_augmentation,
-            **kwargs
-        )
-    elif dataset_type == "combined":
-        return loader.create_combined_loader(
-            datasets=["acdc", "brats2020"],
-            batch_size=batch_size,
-            shuffle=shuffle,
-            apply_augmentation=apply_augmentation,
+            augment=apply_augmentation,
+            preprocessor_config=preprocessor_config,
+            augmentation_config=augmentation_config,
             **kwargs
         )
     else:
-        raise ValueError(f"Unknown dataset_type: {dataset_type}")
+        # For combined datasets, use ACDC as primary
+        return create_research_dataloader(
+            dataset_type="acdc",
+            data_dir=acdc_data_dir,
+            batch_size=batch_size,
+            shuffle=shuffle,
+            augment=apply_augmentation,
+            preprocessor_config=preprocessor_config,
+            augmentation_config=augmentation_config,
+            **kwargs
+        )
 
 
 def setup_model_and_data(

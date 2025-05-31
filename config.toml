@@ -1,17 +1,17 @@
 # Flower Federated Learning Configuration
-# Compatible with Flower 1.18.0 and Standard FedAdam Strategy
+# Optimized for Medical Segmentation Convergence
 
 [tool.flwr.app.config]
 # Server Configuration
-num-rounds = 10
+num-rounds = 15         # More rounds with lower learning rate
 round-timeout = 600
 
-# FedAdam Strategy Parameters
-eta = 0.1           # Server-side learning rate
-eta-l = 0.1         # Client-side learning rate  
-beta-1 = 0.9        # Momentum parameter
-beta-2 = 0.99       # Second moment parameter
-tau = 1e-9          # Adaptability control parameter
+# FedAdam Strategy Parameters (Optimized for Medical Data)
+eta = 0.001             # Server-side learning rate (reduced for stability)
+eta-l = 0.0001          # Client-side learning rate (reduced to prevent overshooting)
+beta-1 = 0.9            # Momentum parameter
+beta-2 = 0.99           # Second moment parameter
+tau = 1e-9              # Adaptability control parameter
 
 # Client Selection
 fraction-fit = 1.0
@@ -19,15 +19,15 @@ fraction-evaluate = 1.0
 min-fit-clients = 1
 min-evaluate-clients = 1
 
-# Medical Domain Adaptations
-noise-adaptation = true
-physics-scheduling = true
-progressive-complexity = true
+# Medical Domain Adaptations (Simplified for better convergence)
+noise-adaptation = false      # Disabled initially for stable convergence
+physics-scheduling = false    # Disabled to focus on segmentation loss
+progressive-complexity = false # Disabled to avoid training complexity
 
-# Training Configuration
-local-epochs = 5
-batch-size = 8
-test-batch-size = 4
+# Training Configuration (Optimized for Medical Segmentation)
+local-epochs = 3        # Reduced to prevent client overfitting
+batch-size = 4          # Smaller batch size for medical data
+test-batch-size = 2     # Smaller test batch size
 weight-decay = 1e-5
 
 # Data Configuration

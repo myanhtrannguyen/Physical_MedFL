@@ -39,20 +39,15 @@ dependencies = [
 packages = ["."] 
 
 [tool.flwr.app]
-# This section tells Flower CLI how to load your app
-# For a single SuperNode that runs both client and server logic (simulation):
-# components.clientapp = "app_client:app"
-# components.serverapp = "app_server:app"
-
-# If you run client and server separately:
-# Client component (when running `flower-client --app ...`)
-# client = "app_client:app"
-
-# Server component (when running `flower-server --app ...`)
-# server = "app_server:app"
+publisher = "flower-federated-learning-medical"
 
 # For running with `flower-simulation` (which is often easier for development)
 # you define the clientapp and serverapp that the simulation engine will use.
 [tool.flwr.app.components]
 clientapp = "src.fl_core.app_client:app"
 serverapp = "src.fl_core.app_server:app"
+
+[tool.flwr.federations]
+
+[tool.flwr.federations.local-simulation]
+options.num-supernodes = 2
