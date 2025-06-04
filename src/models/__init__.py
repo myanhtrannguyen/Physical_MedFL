@@ -2,39 +2,30 @@
 Model components for medical image segmentation in federated learning.
 """
 
-from .mlp_model import (
+from .unet_model import (
     RobustMedVFL_UNet,
-    BasicConvBlock,
-    EncoderBlock,
-    DecoderBlock,
-    MaxwellSolver,
-    ePURE,
+    CombinedLoss,
     DiceLoss,
     PhysicsLoss,
     SmoothnessLoss,
-    CombinedLoss,
     quantum_noise_injection,
-    adaptive_spline_smoothing
+    adaptive_spline_smoothing,
+    ePURE,
+    MaxwellSolver,
+    compute_dice_score,
+    create_unified_data_loader
 )
 
 __all__ = [
-    # Main Model
     'RobustMedVFL_UNet',
-    
-    # Model Components
-    'BasicConvBlock',
-    'EncoderBlock', 
-    'DecoderBlock',
-    'MaxwellSolver',
-    'ePURE',
-    
-    # Loss Functions
-    'DiceLoss',
+    'CombinedLoss',
+    'DiceLoss', 
     'PhysicsLoss',
     'SmoothnessLoss',
-    'CombinedLoss',
-    
-    # Utility Functions
     'quantum_noise_injection',
-    'adaptive_spline_smoothing'
+    'adaptive_spline_smoothing',
+    'ePURE',
+    'MaxwellSolver',
+    'compute_dice_score',
+    'create_unified_data_loader'
 ]
