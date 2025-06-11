@@ -30,86 +30,67 @@ from flwr.common.typing import Scalar, Metrics, NDArrays
 from flwr.common import FitIns, EvaluateIns, ndarrays_to_parameters, parameters_to_ndarrays
 from flwr.server.client_proxy import ClientProxy
 
-# 1.4 Project-Specific Imports - FIXED
-try:
-    from src.models.unet_model import (
-        RobustMedVFL_UNet,
-        CombinedLoss,
-        quantum_noise_injection
-    )
-    from src.data.dataset import ACDCUnifiedDataset, BraTS2020UnifiedDataset, create_unified_dataset
-    from src.data.research_loader import create_research_dataloader, create_federated_research_loaders
-    from src.data.preprocessing import MedicalImagePreprocessor, DataAugmentation
-    from src.utils.seed import set_seed
-    from src.utils.logger import setup_federated_logger
-    SRC_IMPORTS_AVAILABLE = True
-except ImportError:
-    # Fallback imports for development
-    print("Warning: Using fallback imports - some features may be limited")
-    SRC_IMPORTS_AVAILABLE = False
-    
-    # Define fallback functions
-    def set_seed(seed: int):
-        """Fallback seed function"""
-        torch.manual_seed(seed)
-        np.random.seed(seed)
-    
-    def setup_federated_logger(client_id=None, log_dir="logs", level=logging.INFO):
-        """Fallback logger setup"""
-        logger = logging.getLogger(f"server_{client_id}" if client_id else "server")
-        logger.setLevel(level)
-        handler = logging.StreamHandler()
-        formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - [%(funcName)s:%(lineno)d] - %(message)s')
-        handler.setFormatter(formatter)
-        logger.addHandler(handler)
-        return logger
+# 1.4 Project-Specific Imports - DIRECT IMPORTS ONLY
+from src.models.unet_model import (
+    RobustMedVFL_UNet,
+    CombinedLoss,
+    quantum_noise_injection
+)
+from src.data.data import SimpleMedicalDataset, create_simple_dataloader
+from src.utils.seed import set_seed
+from src.utils.logger import setup_federated_logger
 
 # 2. GLOBAL CONFIGURATION AND CONSTANTS
 
 class ServerConstants:
     """Centralized server configuration management"""
     
-    # FedAdam hyperparameters (OPTIMIZED based on FL best practices)
-    DEFAULT_ETA = 0.05  # REDUCED server LR for stable aggregation with new metrics
-    DEFAULT_ETA_L = 0.003  # From good results (matched config.toml)
-    DEFAULT_BETA_1 = 0.85  # INCREASED momentum for stability with macro averaging
-    DEFAULT_BETA_2 = 0.99  # Second moment parameter
-    DEFAULT_TAU = 1e-7  # IMPROVED numerical stability
+    # AdaFedAdam hyperparameters (MATCHED with config.toml for consistency)
+    DEFAULT_ETA = 0.01  # FIXED: Match config.toml (was 0.05)
+    DEFAULT_ETA_L = 0.001  # FIXED: Match config.toml (was 0.003) 
+    DEFAULT_BETA_1 = 0.9  # FIXED: Match config.toml (was 0.85)
+    DEFAULT_BETA_2 = 0.999  # FIXED: Match config.toml (was 0.99)
+    DEFAULT_TAU = 1e-7  # Numerical stability
+    DEFAULT_ALPHA = 0.5  # FIXED: Match config.toml (was 1.0)
     
-    # Aggregation parameters
+    # Aggregation parameters - DYNAMIC BASED ON SUPERNODES
     DEFAULT_FRACTION_FIT = 1.0
     DEFAULT_FRACTION_EVALUATE = 1.0
-    MIN_FIT_CLIENTS = 1
-    MIN_EVALUATE_CLIENTS = 1
-    MIN_AVAILABLE_CLIENTS = 1
+    MIN_FIT_CLIENTS = 1               # Minimum 1 client
+    MIN_EVALUATE_CLIENTS = 1          # Minimum 1 client  
+    MIN_AVAILABLE_CLIENTS = 1         # Minimum 1 client
     MAX_CLIENTS_PER_ROUND = 10
     
-    # Training constants (optimized for medical data with fixed aggregation)
-    DEFAULT_ROUNDS = 25  # MORE rounds for convergence with proper aggregation
-    DEFAULT_LOCAL_EPOCHS = 3  # From good results (was 3 epochs)
-    DEFAULT_BATCH_SIZE = 4  # Keep small batch size for medical segmentation
+    # Training constants (MATCHED with config.toml)
+    DEFAULT_ROUNDS = 20  # FIXED: Match config.toml (was 25)
+    DEFAULT_LOCAL_EPOCHS = 5  # FIXED: Match config.toml (was 3)
+    DEFAULT_BATCH_SIZE = 4  # Small batch size for medical segmentation
     
     # Medical imaging constants
     NUM_CLASSES = 4
     IMG_SIZE = 256
     CLASS_NAMES = ['Background', 'RV', 'Myocardium', 'LV']
     
-    # Resource limits
+    # Resource limits - INCREASED FOR SIMULATION
     MAX_MEMORY_GB = 16
-    COMPUTATION_TIMEOUT = 600  # 10 minutes
-    MAX_MESSAGE_LENGTH = 512 * 1024 * 1024  # 512MB
+    COMPUTATION_TIMEOUT = 1200  # 20 minutes (increased from 10)
+    ROUND_TIMEOUT = 900         # 15 minutes per round  
+    MESSAGE_TIMEOUT = 300       # 5 minutes for messages
+    MAX_MESSAGE_LENGTH = 1024 * 1024 * 1024  # 1GB
 
 def setup_server_environment():
     """Setup server environment with optimal configurations"""
     
+    # Reduce Flower logging verbosity
+    import logging
+    flwr_logger = logging.getLogger("flwr")
+    flwr_logger.setLevel(logging.WARNING)  # Only show warnings and errors
+    
     # Device detection with fallback strategies
     if torch.cuda.is_available():
         device = torch.device('cuda')
-        print(f"Server Device: CUDA GPU - {torch.cuda.get_device_name()}")
-        print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
     else:
         device = torch.device('cpu')
-        print("Server Device: CPU")
     
     # Memory optimization
     if device.type == 'cuda':
@@ -117,29 +98,8 @@ def setup_server_environment():
         torch.backends.cudnn.benchmark = True
         torch.backends.cudnn.deterministic = False  # For performance
     
-    # Random seed management
-    def setup_random_seed(seed=42):
-        """Setup random seed with fallback"""
-        import random
-        random.seed(seed)
-        torch.manual_seed(seed)
-        np.random.seed(seed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed(seed)
-            torch.cuda.manual_seed_all(seed)
-
-    try:
-        if SRC_IMPORTS_AVAILABLE:
-            try:
-                # set_seed should be available from imports if SRC_IMPORTS_AVAILABLE is True
-                set_seed(42)
-            except (NameError, AttributeError):
-                setup_random_seed(42)
-        else:
-            setup_random_seed(42)
-    except Exception as e:
-        setup_random_seed(42)
-        logging.warning(f"Used fallback seed setting due to: {e}")
+    # Random seed setup using imported function
+    set_seed(42)
     
     return device
 
@@ -355,43 +315,25 @@ def create_evaluate_metrics_aggregation_fn() -> Callable:
 def create_global_model(config: Dict[str, Any]):
     """Create and initialize global model for server-side evaluation"""
     
-    try:
-        # Try to create the actual model
-        from src.models.unet_model import RobustMedVFL_UNet
-        
-        model = RobustMedVFL_UNet(
-            n_channels=1,
-            n_classes=config.get('num_classes', ServerConstants.NUM_CLASSES),
-        ).to(DEVICE)
-        
-        # Initialize weights
-        def init_weights(m):
-            if isinstance(m, (nn.Conv2d, nn.ConvTranspose2d)):
-                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
-            elif isinstance(m, nn.BatchNorm2d):
-                nn.init.constant_(m.weight, 1)
+    # Create the actual model using imported RobustMedVFL_UNet
+    model = RobustMedVFL_UNet(
+        n_channels=1,
+        n_classes=config.get('num_classes', ServerConstants.NUM_CLASSES),
+    ).to(DEVICE)
+    
+    # Initialize weights
+    def init_weights(m):
+        if isinstance(m, (nn.Conv2d, nn.ConvTranspose2d)):
+            nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+            if m.bias is not None:
                 nn.init.constant_(m.bias, 0)
-        
-        model.apply(init_weights)
-        print(f"✓ Global model created: RobustMedVFL_UNet")
-        
-        return model
-        
-    except ImportError:
-        print("Warning: RobustMedVFL_UNet not available - using dummy model")
-        
-        # Fallback dummy model
-        class DummyModel(nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.conv = nn.Conv2d(1, 4, 3, padding=1)
-            
-            def forward(self, x):
-                return self.conv(x)
-        
-        return DummyModel().to(DEVICE)
+        elif isinstance(m, nn.BatchNorm2d):
+            nn.init.constant_(m.weight, 1)
+            nn.init.constant_(m.bias, 0)
+    
+    model.apply(init_weights)
+    
+    return model
 
 def get_evaluate_fn(
     global_model,
@@ -402,264 +344,111 @@ def get_evaluate_fn(
     
     def evaluate(server_round: int, parameters: Parameters, config_dict: Dict[str, Scalar]) -> Optional[Tuple[float, Dict[str, Scalar]]]:
         try:
-            print(f"[Round {server_round}] Starting global model evaluation")
-            
             if global_model is None:
-                print("Global model is None, skipping evaluation")
                 return None
-                
-            if test_dataloader is None or len(test_dataloader) == 0:
-                print("No test data available, creating dummy evaluation results")
-                return (1.0, {
-                    "eval_loss": 1.0,
-                    "eval_accuracy": 0.25,
-                    "eval_dice_avg": 0.25,
-                    "eval_dice_class_0": 0.25, "eval_dice_class_1": 0.25, 
-                    "eval_dice_class_2": 0.25, "eval_dice_class_3": 0.25,
-                    "eval_iou_avg": 0.15,
-                    "eval_iou_class_0": 0.15, "eval_iou_class_1": 0.15,
-                    "eval_iou_class_2": 0.15, "eval_iou_class_3": 0.15,
-                    "eval_precision_avg": 0.25,
-                    "eval_recall_avg": 0.25,
-                    "num_test_samples": 10
-                })
             
-            # Set parameters to global model - CRITICAL FIX: Use same method as client
+            if test_dataloader is None or len(test_dataloader) == 0:
+                print(f"[R{server_round}] No test data available - skipping global evaluation")
+                return None
+            
+            # Set parameters to global model using same method as client
             if parameters is not None:
                 try:
-                    # Check if parameters is already a list of ndarrays or a Parameters object
                     if isinstance(parameters, list):
                         parameters_list = parameters
                     else:
-                        # It's a Parameters object, convert to ndarrays
                         parameters_list = parameters_to_ndarrays(parameters)
                     
-                    # CRITICAL FIX: Use same parameter assignment method as client
-                    # Assign parameters using model.parameters() ordering (same as client)
-                    param_idx = 0
-                    for param in global_model.parameters():
-                        if param.requires_grad and param_idx < len(parameters_list):
-                            param.data.copy_(torch.from_numpy(parameters_list[param_idx]).to(param.device))
-                            param_idx += 1
+                    # Use same parameter setting logic as client
+                    model_params = list(global_model.parameters())
+                    trainable_params = [p for p in model_params if p.requires_grad]
                     
-                    print(f"Successfully loaded {param_idx} parameters to global model")
+                    # If no trainable parameters found, use all parameters
+                    if len(trainable_params) == 0:
+                        target_params = model_params
+                    else:
+                        target_params = trainable_params
+                    
+                    # Validate parameter count
+                    if len(parameters_list) == len(target_params):
+                        with torch.no_grad():
+                            for param_tensor, new_param_array in zip(target_params, parameters_list):
+                                new_param_tensor = torch.from_numpy(new_param_array).to(param_tensor.device)
+                                if new_param_tensor.shape == param_tensor.shape:
+                                    param_tensor.copy_(new_param_tensor)
+                    else:
+                        print(f"Warning: Parameter count mismatch: expected {len(target_params)}, got {len(parameters_list)}")
                         
                 except Exception as e:
-                    print(f"Warning: Could not load parameters to global model: {e}")
-                    # Continue evaluation with current global model parameters
+                    print(f"Warning: Could not load parameters: {e}")
             
-            global_model.eval()
+            # Use new research-grade metrics evaluation
+            from src.utils.metrics import evaluate_model_with_research_metrics, convert_metrics_for_fl_server
             
             device = next(global_model.parameters()).device
-            total_loss = 0.0
-            total_samples = 0
-            correct_predictions = 0
-            total_pixels = 0
             
-            # Per-class metrics storage
-            num_classes = 4
-            dice_scores_per_class = [[] for _ in range(num_classes)]
-            iou_scores_per_class = [[] for _ in range(num_classes)]
-            precision_per_class = [0.0] * num_classes
-            recall_per_class = [0.0] * num_classes
+            # Get comprehensive research metrics
+            research_metrics = evaluate_model_with_research_metrics(
+                model=global_model,
+                dataloader=test_dataloader,
+                device=device,
+                num_classes=4,
+                class_names=['Background', 'RV', 'Myocardium', 'LV'],
+                return_detailed=False
+            )
             
-            # Simple criterion for evaluation
-            criterion = nn.CrossEntropyLoss()
+            # Convert to FL-compatible format
+            fl_metrics = convert_metrics_for_fl_server(research_metrics)
             
-            with torch.no_grad():
-                for batch_idx, batch in enumerate(test_dataloader):
-                    try:
-                        if len(batch) == 2:
-                            images, masks = batch
-                        else:
-                            print(f"Warning: Unexpected batch format: {len(batch)} elements")
-                            continue
-                            
-                        images = images.to(device).float()
-                        masks = masks.to(device).long()
-                        
-                        batch_size = images.size(0)
-                        total_samples += batch_size
-                        
-                        # Forward pass
-                        outputs = global_model(images)
-                        
-                        # Handle tuple output (model might return auxiliary outputs)
-                        if isinstance(outputs, tuple):
-                            main_output = outputs[0]
-                        else:
-                            main_output = outputs
-                            
-                        # Compute loss
-                        loss = criterion(main_output, masks)
-                        total_loss += loss.item()  # Now this should work correctly
-                        
-                        # Compute Dice score and other metrics per class
-                        pred_masks = torch.argmax(main_output, dim=1)
-                        
-                        # Overall accuracy
-                        correct_predictions += (pred_masks == masks).sum().item()
-                        total_pixels += masks.numel()
-                        
-                        # Per-class metrics computation
-                        for class_idx in range(num_classes):
-                            # Get binary masks for current class
-                            pred_binary = (pred_masks == class_idx).float()
-                            target_binary = (masks == class_idx).float()
-                            
-                            # Dice score for this class
-                            intersection = (pred_binary * target_binary).sum()
-                            union = pred_binary.sum() + target_binary.sum()
-                            
-                            if union > 0:
-                                dice = (2.0 * intersection) / union
-                                dice_scores_per_class[class_idx].append(dice.item())
-                            else:
-                                dice_scores_per_class[class_idx].append(0.0)
-                            
-                            # IoU score for this class
-                            if union > 0:
-                                iou = intersection / (pred_binary.sum() + target_binary.sum() - intersection)
-                                iou_scores_per_class[class_idx].append(iou.item())
-                            else:
-                                iou_scores_per_class[class_idx].append(0.0)
-                            
-                            # Precision and Recall for this class
-                            true_positive = intersection.item()
-                            predicted_positive = pred_binary.sum().item()
-                            actual_positive = target_binary.sum().item()
-                            
-                            if predicted_positive > 0:
-                                precision_per_class[class_idx] += true_positive / predicted_positive
-                            if actual_positive > 0:
-                                recall_per_class[class_idx] += true_positive / actual_positive
-                                
-                    except Exception as e:
-                        print(f"Error processing batch {batch_idx}: {e}")
-                        continue
-            
-            # Compute final metrics
-            avg_loss = total_loss / len(test_dataloader) if len(test_dataloader) > 0 else 0.0
-            accuracy = correct_predictions / total_pixels if total_pixels > 0 else 0.0
-            
-            # Average per-class metrics
-            avg_dice_per_class = []
-            avg_iou_per_class = []
-            
-            for class_idx in range(num_classes):
-                if dice_scores_per_class[class_idx]:
-                    avg_dice = np.mean(dice_scores_per_class[class_idx])
-                else:
-                    avg_dice = 0.0
-                avg_dice_per_class.append(avg_dice)
-                
-                if iou_scores_per_class[class_idx]:
-                    avg_iou = np.mean(iou_scores_per_class[class_idx])
-                else:
-                    avg_iou = 0.0
-                avg_iou_per_class.append(avg_iou)
-                
-                # Normalize precision/recall by number of batches
-                precision_per_class[class_idx] /= len(test_dataloader)
-                recall_per_class[class_idx] /= len(test_dataloader)
-            
-            # Overall averages (excluding background class 0 for medical metrics)
-            foreground_dice = avg_dice_per_class[1:] if len(avg_dice_per_class) > 1 else avg_dice_per_class
-            foreground_iou = avg_iou_per_class[1:] if len(avg_iou_per_class) > 1 else avg_iou_per_class
-            foreground_precision = precision_per_class[1:] if len(precision_per_class) > 1 else precision_per_class
-            foreground_recall = recall_per_class[1:] if len(recall_per_class) > 1 else recall_per_class
-            
-            avg_dice_foreground = np.mean(foreground_dice) if foreground_dice else 0.0
-            avg_iou_foreground = np.mean(foreground_iou) if foreground_iou else 0.0
-            avg_precision_foreground = np.mean(foreground_precision) if foreground_precision else 0.0
-            avg_recall_foreground = np.mean(foreground_recall) if foreground_recall else 0.0
-            
-            # Prepare detailed metrics dictionary
-            metrics = {
-                # Loss and overall accuracy
-                "eval_loss": float(avg_loss),
-                "eval_accuracy": float(accuracy),
-                "num_test_samples": int(total_samples),
-                
-                # Average metrics (foreground classes)
-                "eval_dice_avg": float(avg_dice_foreground),
-                "eval_iou_avg": float(avg_iou_foreground),
-                "eval_precision_avg": float(avg_precision_foreground),
-                "eval_recall_avg": float(avg_recall_foreground),
-                
-                # Per-class Dice scores
-                "eval_dice_class_0": float(avg_dice_per_class[0]),
-                "eval_dice_class_1": float(avg_dice_per_class[1]),
-                "eval_dice_class_2": float(avg_dice_per_class[2]),
-                "eval_dice_class_3": float(avg_dice_per_class[3]),
-                
-                # Per-class IoU scores
-                "eval_iou_class_0": float(avg_iou_per_class[0]),
-                "eval_iou_class_1": float(avg_iou_per_class[1]),
-                "eval_iou_class_2": float(avg_iou_per_class[2]),
-                "eval_iou_class_3": float(avg_iou_per_class[3]),
-                
-                # Per-class Precision
-                "eval_precision_class_0": float(precision_per_class[0]),
-                "eval_precision_class_1": float(precision_per_class[1]),
-                "eval_precision_class_2": float(precision_per_class[2]),
-                "eval_precision_class_3": float(precision_per_class[3]),
-                
-                # Per-class Recall
-                "eval_recall_class_0": float(recall_per_class[0]),
-                "eval_recall_class_1": float(recall_per_class[1]),
-                "eval_recall_class_2": float(recall_per_class[2]),
-                "eval_recall_class_3": float(recall_per_class[3]),
-                
-                # Additional medical imaging metrics
-                "eval_f1_avg": float(2 * avg_precision_foreground * avg_recall_foreground / (avg_precision_foreground + avg_recall_foreground + 1e-8)),
-                "server_round": int(server_round)
+            # Add server-specific information with proper typing
+            server_info: Dict[str, Scalar] = {
+                "server_round": float(server_round),
+                "global_evaluation": 1.0,
+                "model_name": "RobustMedVFL_UNet"
             }
             
-            # Log formatted results
-            print(f"\n[Round {server_round}] Global Evaluation Results:")
-            print("="*60)
-            print(f"Overall Performance:")
-            print(f"  Loss: {avg_loss:.6f}")
-            print(f"  Accuracy: {accuracy:.6f}")
-            print(f"  Samples: {total_samples}")
-            print("")
-            print(f"Average Metrics (Foreground Classes):")
-            print(f"  Dice Score: {avg_dice_foreground:.6f}")
-            print(f"  IoU Score: {avg_iou_foreground:.6f}")
-            print(f"  Precision: {avg_precision_foreground:.6f}")
-            print(f"  Recall: {avg_recall_foreground:.6f}")
-            print(f"  F1 Score: {2 * avg_precision_foreground * avg_recall_foreground / (avg_precision_foreground + avg_recall_foreground + 1e-8):.6f}")
-            print("")
-            print(f"Per-Class Dice Scores:")
-            print(f"  Class 0 (Background): {avg_dice_per_class[0]:.6f}")
-            print(f"  Class 1 (RV):         {avg_dice_per_class[1]:.6f}")
-            print(f"  Class 2 (Myocardium): {avg_dice_per_class[2]:.6f}")
-            print(f"  Class 3 (LV):         {avg_dice_per_class[3]:.6f}")
-            print("")
-            print(f"Per-Class IoU Scores:")
-            print(f"  Class 0 (Background): {avg_iou_per_class[0]:.6f}")
-            print(f"  Class 1 (RV):         {avg_iou_per_class[1]:.6f}")
-            print(f"  Class 2 (Myocardium): {avg_iou_per_class[2]:.6f}")
-            print(f"  Class 3 (LV):         {avg_iou_per_class[3]:.6f}")
-            print("")
-            print(f"Per-Class Precision:")
-            print(f"  Class 0 (Background): {precision_per_class[0]:.6f}")
-            print(f"  Class 1 (RV):         {precision_per_class[1]:.6f}")
-            print(f"  Class 2 (Myocardium): {precision_per_class[2]:.6f}")
-            print(f"  Class 3 (LV):         {precision_per_class[3]:.6f}")
-            print("")
-            print(f"Per-Class Recall:")
-            print(f"  Class 0 (Background): {recall_per_class[0]:.6f}")
-            print(f"  Class 1 (RV):         {recall_per_class[1]:.6f}")
-            print(f"  Class 2 (Myocardium): {recall_per_class[2]:.6f}")
-            print(f"  Class 3 (LV):         {recall_per_class[3]:.6f}")
-            print("="*60)
+            # Merge metrics dictionaries
+            final_metrics: Dict[str, Scalar] = {}
+            for key, value in fl_metrics.items():
+                final_metrics[key] = float(value) if isinstance(value, (int, float)) else value
+            for key, value in server_info.items():
+                final_metrics[key] = value
             
-            return float(avg_loss), metrics
+            # Use eval_loss as the primary loss metric for FL optimization
+            primary_loss = float(fl_metrics.get('eval_loss', 1.0))
+            
+            # Extract key metrics for consistent access
+            mean_dice = research_metrics.get('mean_dice', 0.0)
+            total_samples = research_metrics.get('total_samples', 0)
+            
+            # Print research summary for monitoring
+            if server_round % 5 == 0:  # Every 5 rounds
+                from src.utils.metrics import print_research_metrics_summary
+                print_research_metrics_summary(research_metrics, f"GLOBAL EVALUATION - Round {server_round}")
+            else:
+                # COMPACT CUSTOM FORMAT - Override Flower's verbose logging
+                mean_dice_fg = research_metrics.get('mean_dice_fg', 0.0)
+                mean_iou = research_metrics.get('mean_iou', 0.0)
+                
+                # Per-class dice for detailed monitoring
+                dice_scores = research_metrics.get('dice_scores', [0,0,0,0])
+                dice_bg, dice_rv, dice_myo, dice_lv = dice_scores[:4] if len(dice_scores) >= 4 else [0,0,0,0]
+                
+                # SINGLE LINE COMPACT FORMAT
+                print(f"[R{server_round:02d}] Loss={primary_loss:.4f} | Dice={mean_dice:.4f} | IoU={mean_iou:.4f} | FG={mean_dice_fg:.4f} | BG={dice_bg:.3f} RV={dice_rv:.3f} Myo={dice_myo:.3f} LV={dice_lv:.3f} | Samples={total_samples}")
+            
+            # Create minimal metrics to prevent verbose Flower logging
+            minimal_metrics = {
+                "server_round": float(server_round),
+                "eval_loss": primary_loss,
+                "dice_score": mean_dice,
+                "samples": float(total_samples)
+            }
+            
+            return primary_loss, minimal_metrics
             
         except Exception as e:
-            print(f"❌ Global evaluation failed: {e}")
+            print(f"Global evaluation failed: {e}")
             import traceback
             traceback.print_exc()
             return None
@@ -669,264 +458,266 @@ def get_evaluate_fn(
 def load_global_test_data(config: Dict[str, Any]) -> Optional[DataLoader]:
     """Load global test dataset for server-side evaluation"""
     
-    try:
-        # Try to load test data from configured path - FIXED PATH
-        test_data_path = config.get('test_data_path', 'data/raw/ACDC/database/testing')
-        
-        if os.path.exists(test_data_path):
-            print(f"Loading global test data from: {test_data_path}")
-            
-            # Create test dataloader using ACDC dataset
-            try:
-                from src.data.research_loader import create_research_dataloader
-                test_dataloader = create_research_dataloader(
-                    dataset_type="acdc",
-                    data_dir=test_data_path,
-                    batch_size=config.get('test_batch_size', 4),
-                    shuffle=False,
-                    augment=False,  # No augmentation for testing
-                    num_workers=0
-                )
-                
-                # Safely get dataset size
-                try:
-                    if hasattr(test_dataloader, 'dataset'):
-                        try:
-                            dataset_size = len(test_dataloader.dataset)  # type: ignore
-                            print(f"✅ Global test data loaded: {dataset_size} samples")
-                        except TypeError:
-                            print(f"✅ Global test data loaded successfully")
-                    else:
-                        print(f"✅ Global test data loaded successfully")
-                except (TypeError, AttributeError):
-                    print(f"✅ Global test data loaded successfully")
-                
-                return test_dataloader
-                
-            except ImportError:
-                print("Warning: create_research_dataloader not available - using dummy data")
-                return None
-        else:
-            print(f"Warning: Test data path not found: {test_data_path}")
-            # Try alternative paths
-            alt_paths = [
-                'data/raw/ACDC/database/training',  # Use training as fallback
-                'data/raw/ACDC/training',
-                'data/raw/ACDC'
-            ]
-            
-            for alt_path in alt_paths:
-                if os.path.exists(alt_path):
-                    print(f"Using alternative test path: {alt_path}")
-                    try:
-                        from src.data.research_loader import create_research_dataloader
-                        test_dataloader = create_research_dataloader(
-                            dataset_type="acdc",
-                            data_dir=alt_path,
-                            batch_size=config.get('test_batch_size', 4),
-                            shuffle=False,
-                            augment=False,
-                            num_workers=0
-                        )
-                        print(f"✅ Global test data loaded from alternative path")
-                        return test_dataloader
-                    except Exception as e:
-                        print(f"Failed to load from {alt_path}: {e}")
-                        continue
-            
-            print("No valid test data path found")
-            return None
-            
-    except Exception as e:
-        print(f"Error loading global test data: {e}")
-        return None
-
-# 5. FIXED FEDADAM IMPLEMENTATION
-
-class FixedFedAdam(FedAdam):
-    """
-    Fixed FedAdam implementation to resolve client-server metric mismatch
-    Key fixes:
-    1. Proper moment initialization 
-    2. Correct aggregation with parameter shapes verification
-    3. Non-IID data handling improvements
-    """
+    # Load test data from configured path
+    test_data_path = config.get('test_data_path', 'data/raw/ACDC/database/testing')
     
-    def __init__(self, initial_parameters=None, **kwargs):
-        # Extract FedAdam specific parameters
-        self.eta = kwargs.pop('eta', 0.1)
-        self.eta_l = kwargs.pop('eta_l', 0.01) 
-        self.beta_1 = kwargs.pop('beta_1', 0.9)
-        self.beta_2 = kwargs.pop('beta_2', 0.999)
-        self.tau = kwargs.pop('tau', 1e-4)
-        
-        # FIXED: Ensure initial_parameters is not None before calling parent
-        if initial_parameters is None:
-            raise ValueError("initial_parameters cannot be None for FixedFedAdam")
-        
-        # Initialize parent class
-        super().__init__(
-            initial_parameters=initial_parameters,
-            eta=self.eta,
-            eta_l=self.eta_l,
-            beta_1=self.beta_1,
-            beta_2=self.beta_2,
-            tau=self.tau,
-            **kwargs
+    if os.path.exists(test_data_path):
+        test_dataloader = create_simple_dataloader(
+            data_dir=test_data_path,
+            batch_size=config.get('test_batch_size', 4),
+            shuffle=False,
+            augment=False,  # FIXED: No augmentation for testing!
+            num_workers=0
         )
         
-        # CRITICAL FIX: Properly initialize moments from initial parameters
-        self.current_weights = parameters_to_ndarrays(initial_parameters)
-        # Initialize moments to zeros (critical for convergence)
-        self.m_t = [np.zeros_like(w, dtype=np.float32) for w in self.current_weights]
-        self.v_t = [np.zeros_like(w, dtype=np.float32) for w in self.current_weights]
-        self.server_round = 0
+        return test_dataloader
         
-        print(f"FixedFedAdam initialized:")
-        print(f"  Parameters: {len(self.current_weights)} arrays")
-        print(f"  Total parameters: {sum(w.size for w in self.current_weights):,}")
-        print(f"  Moments initialized: m_t={len(self.m_t)}, v_t={len(self.v_t)}")
-        print(f"  Hyperparameters: eta={self.eta}, eta_l={self.eta_l}, β₁={self.beta_1}, β₂={self.beta_2}, τ={self.tau}")
+    else:
+        # Try alternative paths
+        alt_paths = [
+            'data/raw/ACDC/database/training',  # Use training as fallback
+            'data/raw/ACDC/training',
+            'data/raw/ACDC'
+        ]
+        
+        for alt_path in alt_paths:
+            if os.path.exists(alt_path):
+                test_dataloader = create_simple_dataloader(
+                    data_dir=alt_path,
+                    batch_size=config.get('test_batch_size', 4),
+                    shuffle=False,
+                    augment=False,  # FIXED: No augmentation for testing!
+                    num_workers=0
+                )
+                return test_dataloader
+        
+        return None
+
+# 5. ADAPTIVE FEDERATED ADAM IMPLEMENTATION
+
+class AdaFedAdam(FedAdam):
+    """
+    Adaptive Federated Adam (AdaFedAdam) with fairness control.
     
-    def aggregate_fit(self, server_round: int, results, failures):
-        """Fixed aggregation with proper moment updates and debugging"""
+    Based on: "AdaFedAdam: Adaptive Federated Optimization with Fairness" (arXiv:2301.09357)
+    
+    Key improvements over FedAdam:
+    - Adaptive fairness weighting based on client loss ratios
+    - Better handling of non-IID data distribution
+    - Fairness control through alpha hyperparameter
+    """
+
+    def __init__(
+        self,
+        *,
+        alpha: float = 2.0,  # Fairness hyperparameter
+        initial_parameters: Parameters,
+        **kwargs
+    ):
+        """
+        Initialize AdaFedAdam strategy.
         
+        Args:
+            alpha: Fairness hyperparameter controlling adaptive weighting
+            initial_parameters: Initial model parameters
+            **kwargs: Additional arguments passed to FedAdam
+        """
+        super().__init__(initial_parameters=initial_parameters, **kwargs)
+        self.alpha = alpha
+        self.client_initial_losses = {}  # Store initial loss for each client
+        self.client_latest_losses = {}   # Store latest loss for each client
+        
+        print(f"✓ AdaFedAdam initialized: α={alpha}, Medical FL with fairness weighting")
+
+    def aggregate_fit(
+        self,
+        server_round: int,
+        results: List[Tuple[ClientProxy, FitRes]],
+        failures: List[Tuple[ClientProxy, FitRes] | BaseException],
+    ) -> Tuple[Optional[Parameters], Dict[str, Scalar]]:
+        """
+        Aggregate model updates with adaptive fairness weighting.
+        
+        Args:
+            server_round: Current federated learning round
+            results: Client fit results
+            failures: Failed client results
+            
+        Returns:
+            Aggregated parameters and metrics
+        """
         if not results:
-            print(f"[Round {server_round}] No results to aggregate")
+            print(f"[R{server_round}] No results to aggregate")
             return None, {}
+
+        # Step 1: Gather client losses and weights (silent processing)
+        client_ids = []
+        client_losses = []
+        client_updates = []
+        num_examples_list = []
         
-        self.server_round = server_round
-        print(f"\n[Round {server_round}] FixedFedAdam aggregation starting...")
-        print(f"  Results received: {len(results)}")
-        print(f"  Failures: {len(failures)}")
-        
-        # Collect weights and metrics from results
-        weights_results = []
-        total_examples = 0
-        
+        # Step 2: Process each client result silently
         for client_proxy, fit_res in results:
-            # Extract parameters and number of examples
-            parameters_list = parameters_to_ndarrays(fit_res.parameters)
-            num_examples = fit_res.num_examples
+            cid = client_proxy.cid
             
-            weights_results.append((parameters_list, num_examples))
-            total_examples += num_examples
-            
-            print(f"  Client {client_proxy.cid}: {num_examples} examples, {len(parameters_list)} parameter arrays")
-        
-        if total_examples == 0:
-            print("Error: Total examples is 0")
-            return None, {}
-        
-        # CRITICAL FIX: Federated averaging with proper weighting
-        print(f"  Computing federated average across {len(weights_results)} clients...")
-        
-        # Initialize aggregated weights
-        aggregated_weights = None
-        
-        for client_weights, num_examples in weights_results:
-            weight = num_examples / total_examples
-            
-            if aggregated_weights is None:
-                # Initialize with first client's weights
-                aggregated_weights = [weight * w for w in client_weights]
-            else:
-                # Add weighted contributions
-                for i, w in enumerate(client_weights):
-                    aggregated_weights[i] += weight * w
-        
-        # CRITICAL FIX: Ensure aggregated_weights is not None
-        if aggregated_weights is None:
-            print("Error: Failed to aggregate weights")
-            return None, {}
-        
-        # CRITICAL FIX: Compute pseudo-gradients for Adam updates
-        # Initialize avg_grad_norm for all paths
-        avg_grad_norm = 0.0
-        
-        # First round - initialize current weights
-        if self.current_weights is None or len(self.current_weights) == 0:
-            self.current_weights = [w.copy() for w in aggregated_weights]
-            self.m_t = [np.zeros_like(w, dtype=np.float32) for w in aggregated_weights]
-            self.v_t = [np.zeros_like(w, dtype=np.float32) for w in aggregated_weights]
-            print(f"  Initialized server state with {len(self.current_weights)} parameter arrays")
-        else:
-            # Compute pseudo-gradients (difference between aggregated and current)
-            pseudo_gradients = []
-            grad_norms = []
-            
-            for curr_w, agg_w in zip(self.current_weights, aggregated_weights):
-                pseudo_grad = agg_w - curr_w  # This represents the "gradient" direction
-                pseudo_gradients.append(pseudo_grad)
-                grad_norms.append(np.linalg.norm(pseudo_grad))
-            
-            avg_grad_norm = np.mean(grad_norms) if grad_norms else 0.0
-            print(f"  Average pseudo-gradient norm: {avg_grad_norm:.6f}")
-            
-            # CRITICAL FIX: Adam moment updates with proper null checks
-            print(f"  Updating Adam moments...")
-            
-            # Ensure moments are initialized
-            if self.m_t is None or len(self.m_t) != len(pseudo_gradients):
-                self.m_t = [np.zeros_like(grad, dtype=np.float32) for grad in pseudo_gradients]
-            if self.v_t is None or len(self.v_t) != len(pseudo_gradients):
-                self.v_t = [np.zeros_like(grad, dtype=np.float32) for grad in pseudo_gradients]
-            
-            for i, pseudo_grad in enumerate(pseudo_gradients):
-                # First moment estimate (exponential moving average of gradients)
-                self.m_t[i] = self.beta_1 * self.m_t[i] + (1 - self.beta_1) * pseudo_grad
+            # Get train_loss from metrics (required for AdaFedAdam)
+            train_loss = fit_res.metrics.get("train_loss", 1.0)
+            if train_loss == 0.0:  # Avoid division by zero
+                train_loss = 1e-6
                 
-                # Second moment estimate (exponential moving average of squared gradients)
-                self.v_t[i] = self.beta_2 * self.v_t[i] + (1 - self.beta_2) * (pseudo_grad ** 2)
+            self.client_latest_losses[cid] = train_loss
+            
+            # Store initial loss on first round
+            if cid not in self.client_initial_losses:
+                self.client_initial_losses[cid] = train_loss
+            
+            client_ids.append(cid)
+            client_losses.append(train_loss)
+            client_updates.append(parameters_to_ndarrays(fit_res.parameters))
+            num_examples_list.append(fit_res.num_examples)
+
+        # Step 3: Compute adaptive weights (AdaFedAdam Eq.9)
+        weights = []
+        total_examples = sum(num_examples_list)
+        
+        for cid, loss, num_examples in zip(client_ids, client_losses, num_examples_list):
+            initial_loss = self.client_initial_losses.get(cid, loss)
+            
+            # Compute loss improvement ratio
+            if loss > 0:
+                improvement_ratio = initial_loss / loss
+            else:
+                improvement_ratio = 1.0
+            
+            # Adaptive weight computation (combines fairness and data size)
+            fairness_weight = improvement_ratio ** self.alpha
+            data_weight = num_examples / total_examples
+            
+            # Combine fairness and data weighting
+            adaptive_weight = fairness_weight * data_weight
+            weights.append(adaptive_weight)
+
+        # Normalize weights to sum to 1
+        weight_sum = sum(weights)
+        if weight_sum > 0:
+            weights = [w / weight_sum for w in weights]
+        else:
+            # Fallback to uniform weighting
+            weights = [1.0 / len(client_ids) for _ in client_ids]
+
+        # Step 4: Weighted average of updates (silent processing)
+        agg_update = []
+        
+        if len(client_updates[0]) > 0:
+            for i in range(len(client_updates[0])):
+                weighted_sum = sum(w * update[i] for w, update in zip(weights, client_updates))
+                agg_update.append(weighted_sum)
+        else:
+            return None, {}
+
+        # Step 5: Adam moment updates (same as FedAdam but with proper initialization)
+        if not hasattr(self, "current_weights") or self.current_weights is None:
+            self.current_weights = [np.copy(w) for w in agg_update]
+            self.m_t = [np.zeros_like(w, dtype=np.float32) for w in agg_update]
+            self.v_t = [np.zeros_like(w, dtype=np.float32) for w in agg_update]
+        else:
+            # Ensure m_t and v_t are initialized
+            if not hasattr(self, "m_t") or self.m_t is None:
+                self.m_t = [np.zeros_like(w, dtype=np.float32) for w in agg_update]
+            if not hasattr(self, "v_t") or self.v_t is None:
+                self.v_t = [np.zeros_like(w, dtype=np.float32) for w in agg_update]
+            
+            # Compute parameter updates (pseudo-gradients)
+            delta_t = [agg - curr for agg, curr in zip(agg_update, self.current_weights)]
+            
+            # Adam moment updates - with proper type checking
+            if self.m_t is not None and self.v_t is not None:
+                self.m_t = [
+                    self.beta_1 * m + (1 - self.beta_1) * d
+                    for m, d in zip(self.m_t, delta_t)
+                ]
+                self.v_t = [
+                    self.beta_2 * v + (1 - self.beta_2) * (d ** 2)
+                    for v, d in zip(self.v_t, delta_t)
+                ]
                 
                 # Bias correction
-                m_corrected = self.m_t[i] / (1 - self.beta_1 ** server_round)
-                v_corrected = self.v_t[i] / (1 - self.beta_2 ** server_round)
+                m_hat = [m / (1 - self.beta_1 ** server_round) for m in self.m_t]
+                v_hat = [v / (1 - self.beta_2 ** server_round) for v in self.v_t]
                 
-                # Adam update
-                self.current_weights[i] = self.current_weights[i] + self.eta * m_corrected / (np.sqrt(v_corrected) + self.tau)
-            
-            # Compute update statistics
-            m_norms = [np.linalg.norm(m) for m in self.m_t]
-            v_norms = [np.linalg.norm(v) for v in self.v_t]
-            
-            print(f"  Moment statistics:")
-            print(f"    m_t average norm: {np.mean(m_norms):.6f}")
-            print(f"    v_t average norm: {np.mean(v_norms):.6f}")
-            print(f"    Parameter update applied with η={self.eta}")
+                # Adaptive learning rate with bias correction
+                eta_norm = (
+                    self.eta
+                    * np.sqrt(1 - self.beta_2 ** server_round)
+                    / (1 - self.beta_1 ** server_round)
+                )
+                
+                # Parameter update
+                self.current_weights = [
+                    curr + eta_norm * m / (np.sqrt(v) + self.tau)
+                    for curr, m, v in zip(self.current_weights, m_hat, v_hat)
+                ]
+
+        # Step 6: Return new parameters and aggregated metrics
+        new_parameters = ndarrays_to_parameters(self.current_weights)
         
-        # Convert back to Parameters object
-        aggregated_parameters = ndarrays_to_parameters(self.current_weights)
-        
-        # Aggregate metrics from fit results
+        # Aggregate fit metrics using parent's method if available
         aggregated_metrics: Dict[str, Scalar] = {}
-        if results:
-            # Call parent's fit metrics aggregation
-            if hasattr(self, 'fit_metrics_aggregation_fn') and self.fit_metrics_aggregation_fn:
-                metrics_list = [(fit_res.num_examples, fit_res.metrics) for _, fit_res in results]
-                aggregated_metrics = self.fit_metrics_aggregation_fn(metrics_list)
-            
-            # Add server-side metrics with proper typing
-            server_metrics: Dict[str, Scalar] = {
-                "server_round": float(server_round),
-                "total_examples": float(total_examples),
-                "num_clients_aggregated": float(len(results)),
-                "avg_gradient_norm": float(avg_grad_norm),
-                "fedadam_eta": float(self.eta),
-                "fedadam_eta_l": float(self.eta_l)
-            }
-            aggregated_metrics.update(server_metrics)
+        if hasattr(self, 'fit_metrics_aggregation_fn') and self.fit_metrics_aggregation_fn:
+            metrics_list = [(fit_res.num_examples, fit_res.metrics) for _, fit_res in results]
+            aggregated_metrics = self.fit_metrics_aggregation_fn(metrics_list)
         
-        print(f"[Round {server_round}] FixedFedAdam aggregation completed successfully")
+        # Add AdaFedAdam specific metrics
+        avg_loss = float(np.mean(client_losses))
+        weight_entropy = float(self._compute_weight_entropy(weights))
+        fairness_variance = float(np.var([w * len(weights) for w in weights]))
         
-        return aggregated_parameters, aggregated_metrics
+        adafedadam_metrics: Dict[str, Scalar] = {
+            "adafedadam_alpha": float(self.alpha),
+            "server_round": float(server_round),
+            "num_clients_aggregated": float(len(results)),
+            "total_examples": float(sum(num_examples_list)),
+            "avg_client_loss": avg_loss,
+            "weight_entropy": weight_entropy,
+            "fairness_variance": fairness_variance,
+        }
+        
+        # Merge metrics
+        aggregated_metrics.update(adafedadam_metrics)
+        
+        # OPTIMIZED: Single compact research metrics line
+        loss_improvements = [
+            (self.client_initial_losses.get(cid, loss) - loss) / max(self.client_initial_losses.get(cid, loss), 1e-6)
+            for cid, loss in zip(client_ids, client_losses)
+        ]
+        avg_improvement = np.mean(loss_improvements) if loss_improvements else 0.0
+        client_weights_summary = f"[{min(weights):.2f}→{max(weights):.2f}]"
+        
+        # COMPACT ADAFEDADAM FORMAT
+        print(f"[R{server_round:02d}] AdaFedAdam: {len(results)}C | Loss={avg_loss:.4f} | Improve={avg_improvement:.1%} | Weights={client_weights_summary}")
+        
+        return new_parameters, aggregated_metrics
+    
+    def _compute_weight_entropy(self, weights: List[float]) -> float:
+        """Compute entropy of aggregation weights to measure fairness."""
+        weights_array = np.array(weights, dtype=np.float32)
+        weights_array = weights_array / np.sum(weights_array)  # Ensure normalized
+        weights_array = weights_array[weights_array > 0]  # Remove zero weights
+        
+        if len(weights_array) <= 1:
+            return 0.0
+        
+        entropy = -np.sum(weights_array * np.log(weights_array + 1e-8))
+        max_entropy = np.log(len(weights_array))  # Maximum possible entropy
+        
+        return float(entropy / max_entropy) if max_entropy > 0 else 0.0  # Normalized entropy
 
 # 6. SERVER FACTORY FUNCTION - UPDATED FOR STANDARD FEDADAM
 
 # 7. SERVERAPP CREATION AND EXPORT - UPDATED FOR FLOWER 1.18.0
 
 def server_fn(context: Context) -> fl.server.ServerAppComponents:
-    """Create server components for Flower 1.18.0 with integrated time estimation"""
+    """Create server components for Flower 1.18.0 with AdaFedAdam strategy"""
     
     # Extract configuration from context if available, otherwise use defaults
     try:
@@ -937,17 +728,22 @@ def server_fn(context: Context) -> fl.server.ServerAppComponents:
             'beta_1': context.run_config.get('beta-1', ServerConstants.DEFAULT_BETA_1),
             'beta_2': context.run_config.get('beta-2', ServerConstants.DEFAULT_BETA_2),
             'tau': context.run_config.get('tau', ServerConstants.DEFAULT_TAU),
+            'alpha': context.run_config.get('alpha', ServerConstants.DEFAULT_ALPHA),  # AdaFedAdam fairness parameter
             'min_fit_clients': context.run_config.get('min-fit-clients', ServerConstants.MIN_FIT_CLIENTS),
             'min_evaluate_clients': context.run_config.get('min-evaluate-clients', ServerConstants.MIN_EVALUATE_CLIENTS),
             'fraction_fit': context.run_config.get('fraction-fit', ServerConstants.DEFAULT_FRACTION_FIT),
             'fraction_evaluate': context.run_config.get('fraction-evaluate', ServerConstants.DEFAULT_FRACTION_EVALUATE),
-            'test_data_path': context.run_config.get('test-data-path', 'data/raw/ACDC/database/testing'),  # Fixed path
+            'test_data_path': context.run_config.get('test-data-path', 'data/raw/ACDC/database/testing'),
             'enable_global_evaluation': context.run_config.get('enable-global-evaluation', True),
             'noise_adaptation': context.run_config.get('noise-adaptation', True),
             'physics_scheduling': context.run_config.get('physics-scheduling', True),
             'progressive_complexity': context.run_config.get('progressive-complexity', True),
             'local_epochs': context.run_config.get('local-epochs', ServerConstants.DEFAULT_LOCAL_EPOCHS),
             'batch_size': context.run_config.get('batch-size', ServerConstants.DEFAULT_BATCH_SIZE),
+            # Timeout configurations
+            'round_timeout': context.run_config.get('round-timeout', ServerConstants.ROUND_TIMEOUT),
+            'message_timeout': context.run_config.get('message-timeout', ServerConstants.MESSAGE_TIMEOUT),
+            'metadata_ttl': context.run_config.get('metadata-ttl', 3600),
         }
     except:
         server_config = {
@@ -957,6 +753,7 @@ def server_fn(context: Context) -> fl.server.ServerAppComponents:
             'beta_1': ServerConstants.DEFAULT_BETA_1,
             'beta_2': ServerConstants.DEFAULT_BETA_2,
             'tau': ServerConstants.DEFAULT_TAU,
+            'alpha': ServerConstants.DEFAULT_ALPHA,
             'min_fit_clients': ServerConstants.MIN_FIT_CLIENTS,
             'min_evaluate_clients': ServerConstants.MIN_EVALUATE_CLIENTS,
             'fraction_fit': ServerConstants.DEFAULT_FRACTION_FIT,
@@ -968,63 +765,96 @@ def server_fn(context: Context) -> fl.server.ServerAppComponents:
             'progressive_complexity': True,
             'local_epochs': ServerConstants.DEFAULT_LOCAL_EPOCHS,
             'batch_size': ServerConstants.DEFAULT_BATCH_SIZE,
+            # Timeout configurations
+            'round_timeout': ServerConstants.ROUND_TIMEOUT,
+            'message_timeout': ServerConstants.MESSAGE_TIMEOUT,
+            'metadata_ttl': 3600,
         }
     
     # === INTEGRATED TIME ESTIMATION ===
-    print("\nFEDERATED LEARNING SERVER STARTING...")
-    print("=" * 70)
+    print("AdaFedAdam Server Starting...")
     
     try:
-        # Extract number of clients from environment or estimate
-        num_clients = 3  # Default
-        if hasattr(context, 'state') and context.state:
-            # Try to get from context state
-            raw_num_clients = context.state.get('num_supernodes', 3)
-            num_clients = int(raw_num_clients) if isinstance(raw_num_clients, (int, str)) else 3
+        # Extract number of clients dynamically
+        num_clients = None
         
-        # Parse configuration for estimation
-        config_for_estimation = parse_server_config_for_estimation(context)
+        # Try to get from context run_config
+        if hasattr(context, 'run_config') and context.run_config:
+            raw_num_clients = getattr(context.run_config, 'num_supernodes', None)
+            if raw_num_clients:
+                try:
+                    num_clients = int(str(raw_num_clients))
+                except (ValueError, TypeError):
+                    pass
+        
+        # Try to get from context state if available
+        if not num_clients and hasattr(context, 'state') and context.state:
+            raw_num_clients = context.state.get('num_supernodes')
+            if raw_num_clients:
+                try:
+                    num_clients = int(str(raw_num_clients))
+                except (ValueError, TypeError):
+                    pass
+        
+        # Check environment variables for supernodes
+        if not num_clients:
+            env_vars_to_check = ['FLWR_NUM_SUPERNODES', 'NUM_SUPERNODES', 'FLOWER_NUM_SUPERNODES']
+            for env_var in env_vars_to_check:
+                env_value = os.environ.get(env_var)
+                if env_value:
+                    try:
+                        num_clients = int(env_value)
+                        break
+                    except ValueError:
+                        continue
+        
+        # Try to parse from sys.argv
+        if not num_clients:
+            import sys
+            try:
+                argv = sys.argv
+                for i, arg in enumerate(argv):
+                    if arg == '--num-supernodes' and i + 1 < len(argv):
+                        num_clients = int(argv[i + 1])
+                        break
+            except (ValueError, IndexError):
+                pass
+        
+        # Use default if not found
+        if num_clients is None:
+            num_clients = 5
         
         # Calculate time estimates
+        config_for_estimation = parse_server_config_for_estimation(context)
         training_estimate = estimate_fl_training_time(
             num_rounds=config_for_estimation['num_rounds'],
             num_clients=num_clients,
             local_epochs=config_for_estimation['local_epochs'],
-            train_samples=150,  # Default ACDC training samples
+            train_samples=150,
             batch_size=config_for_estimation['batch_size']
         )
         
         testing_estimate = estimate_fl_testing_time(
-            test_samples=50,  # Default ACDC test samples
+            test_samples=50,
             batch_size=config_for_estimation['batch_size'],
             num_eval_rounds=config_for_estimation['num_rounds']
         )
         
-        # Display time estimates
-        display_fl_time_estimates(training_estimate, testing_estimate, num_clients)
+        # Display concise time estimates
+        total_time = training_estimate['total_training_time'] + testing_estimate['total_testing_time']
+        print(f"Estimated completion: {format_fl_duration(total_time)} | "
+              f"Clients: {num_clients} | Device: {training_estimate['device_name']}")
         
-    except Exception as e:
-        print(f"Could not calculate time estimates: {e}")
-        print("Proceeding with federated learning...")
+    except Exception:
+        pass  # Skip time estimation if it fails
     
-    print(f"\nSERVER CONFIGURATION:")
-    print(f"   Rounds: {server_config['num_rounds']}")
-    print(f"   Local epochs: {server_config['local_epochs']}")
-    print(f"   Batch size: {server_config['batch_size']}")
-    print(f"   Min fit clients: {server_config['min_fit_clients']}")
-    print(f"   Min evaluate clients: {server_config['min_evaluate_clients']}")
-    print(f"   Server learning rate: {server_config['eta']}")
-    print(f"   Client learning rate: {server_config['eta_l']}")
-    print("=" * 70)
-    
-    # Rest of the original server_fn code...
     # Setup environment
     device = setup_server_environment()
     
-    # 6.2 Global Model Initialization
+    # Global Model Initialization
     global_model = create_global_model(server_config)
 
-    # CRITICAL FIX: Get initial parameters using SAME method as client (model.parameters())
+    # Get initial parameters using SAME method as client (model.parameters())
     initial_parameters_list = []
     
     # Count trainable parameters (like client does)
@@ -1038,16 +868,12 @@ def server_fn(context: Context) -> fl.server.ServerAppComponents:
             initial_parameters_list.append(param_array)
             trainable_count += 1
     
-    print(f"Server found {trainable_count} trainable, {total_count - trainable_count} non-trainable parameters")
-    
     # If no trainable parameters found, use all parameters (same fallback as client)
     if len(initial_parameters_list) == 0:
-        print("Warning: No trainable parameters found in global model, using all parameters")
         for param in global_model.parameters():
             initial_parameters_list.append(param.detach().cpu().numpy())
     
     initial_parameters = ndarrays_to_parameters(initial_parameters_list)
-    print(f"Extracted {len(initial_parameters_list)} parameter arrays from global model")
 
     # Global test data loading
     test_dataloader = None
@@ -1058,9 +884,6 @@ def server_fn(context: Context) -> fl.server.ServerAppComponents:
     evaluate_fn = None
     if test_dataloader is not None:
         evaluate_fn = get_evaluate_fn(global_model, test_dataloader, server_config)
-        print("Global evaluation function configured")
-    else:
-        print("Global evaluation disabled - no test data available")
 
     # Create configuration functions
     fit_config_fn = create_fit_config_fn(server_config)
@@ -1070,42 +893,38 @@ def server_fn(context: Context) -> fl.server.ServerAppComponents:
     fit_metrics_aggregation_fn = create_fit_metrics_aggregation_fn()
     evaluate_metrics_aggregation_fn = create_evaluate_metrics_aggregation_fn()
 
-    # Create strategy with optimized configuration for better performance using STANDARD FedAdam
-    strategy = FedAdam(
+    # Create AdaFedAdam strategy with optimized configuration for medical imaging
+    strategy = AdaFedAdam(
+        alpha=float(server_config['alpha']),  # Fairness hyperparameter
+        initial_parameters=initial_parameters,
         fraction_fit=float(server_config['fraction_fit']),
         fraction_evaluate=float(server_config['fraction_evaluate']),
         min_fit_clients=int(server_config['min_fit_clients']),
         min_evaluate_clients=int(server_config['min_evaluate_clients']),
-        min_available_clients=int(server_config['min_fit_clients']),  # Same as min_fit_clients
-        evaluate_fn=evaluate_fn,  # Enable server-side evaluation
+        min_available_clients=int(server_config['min_fit_clients']),
+        evaluate_fn=evaluate_fn,
         on_fit_config_fn=fit_config_fn,
         on_evaluate_config_fn=evaluate_config_fn,
-        accept_failures=True,  # Accept some client failures
-        initial_parameters=initial_parameters,  # Use Parameters object
+        accept_failures=True,
         fit_metrics_aggregation_fn=fit_metrics_aggregation_fn,
         evaluate_metrics_aggregation_fn=evaluate_metrics_aggregation_fn,
-        # FedAdam specific parameters - TUNED for medical imaging non-IID data
+        # AdaFedAdam/FedAdam specific parameters - TUNED for medical imaging
         eta=float(server_config['eta']),  # Server learning rate
         eta_l=float(server_config['eta_l']),  # Client learning rate
         beta_1=float(server_config['beta_1']),  # First moment decay
         beta_2=float(server_config['beta_2']),  # Second moment decay  
-        tau=float(server_config['tau']),  # Controls adaptability
+        tau=float(server_config['tau']),  # Numerical stability
     )
-
-    print("STANDARD FedAdam strategy initialized with tuned medical parameters")
 
     # Server configuration
     config = ServerConfig(
         num_rounds=int(server_config['num_rounds']),
-        round_timeout=ServerConstants.COMPUTATION_TIMEOUT
+        round_timeout=int(server_config.get('round_timeout', ServerConstants.ROUND_TIMEOUT))
     )
 
-    print("MEDICAL FEDERATED LEARNING SERVER READY")
-    print(f"Configuration Summary:")
-    print(f" • Strategy: Standard FedAdam with medical adaptations")
-    print(f" • Adam parameters: β₁={server_config['beta_1']}, β₂={server_config['beta_2']}, τ={server_config['tau']}")
-    print(f" • Global evaluation: {'Enabled' if evaluate_fn else 'Disabled'}")
-    print(f" • Medical adaptations: Noise={server_config['noise_adaptation']}, Physics={server_config['physics_scheduling']}, Progressive={server_config['progressive_complexity']}")
+    print(f"AdaFedAdam Server Ready: {server_config['num_rounds']} rounds | "
+          f"α={server_config['alpha']} | "
+          f"Eval={'On' if evaluate_fn else 'Off'}")
 
     return fl.server.ServerAppComponents(
         strategy=strategy,
@@ -1118,41 +937,22 @@ app = ServerApp(server_fn=server_fn)
 # 7. MAIN EXECUTION AND CLI SUPPORT
 
 if __name__ == "__main__":
-    print("ENHANCED MEDICAL FEDERATED LEARNING SERVER v4.0")
-    print("ADVANCED FEATURES:")
-    print("✓ Standard FedAdam strategy (Flower 1.18.0 compatible)")
-    print("✓ Progressive model complexity scheduling")
-    print("✓ Medical domain-specific noise adaptation")
-    print("✓ Physics-informed constraint scheduling")
-    print("✓ Comprehensive medical metrics aggregation")
-    print("✓ Global model evaluation with clinical metrics")
-    print("✓ Adaptive learning rate scheduling")
-    print("✓ Production-ready error handling and logging")
-    print("")
-    print("MEDICAL SPECIALIZATIONS:")
-    print("✓ ACDC cardiac segmentation optimization")
-    print("✓ Medical-safe data augmentation")
-    print("✓ Clinical performance metrics (Dice, IoU)")
-    print("✓ Physics-informed Maxwell equation constraints")
-    print("✓ Quantum noise injection for robustness")
-    print("✓ Adaptive complexity scheduling")
-    print("\n DEPLOYMENT OPTIONS:")
-    print("1. CLI (recommended): flwr run . --run-config config.toml")
-    print("2. Legacy CLI: flower-server --app fl_core.app_server:app")
-    print("3. Direct execution: python app_server.py --start-server")
+    print("Medical Federated Learning Server v4.0")
+    print("✓ AdaFedAdam strategy (Flower 1.18.0)")
+    print("✓ Medical domain optimizations")
+    print("✓ Adaptive fairness weighting")
+    print("\nDeployment: flwr run . --run-config config.toml")
     
     # Direct execution option for development
     import sys
     
     if "--start-server" in sys.argv:
         try:
-            print("\n Starting Flower server directly...")
-            print("Note: Using default configuration for direct execution")
+            print("Starting Flower server...")
             
             # Create a dummy context for direct execution
             from flwr.common import Context
             
-            # Create a minimal context-like object
             class DummyRunConfig:
                 def get(self, key, default=None):
                     return default
@@ -1162,31 +962,20 @@ if __name__ == "__main__":
                     self.run_config = DummyRunConfig()
             
             dummy_context = DummyContext()
-            
-            # Get server components
             server_components = server_fn(dummy_context)  # type: ignore
             
-            if server_components.config:
-                print(f"Starting server with {server_components.config.num_rounds} rounds...")
-            else:
-                print("Starting server with default configuration...")
-            
-            # Start server using server components
             fl.server.start_server(
                 server_address="0.0.0.0:8080",
                 config=server_components.config,
                 strategy=server_components.strategy,
                 grpc_max_message_length=ServerConstants.MAX_MESSAGE_LENGTH,
-                certificates=None  # No SSL for development
+                certificates=None
             )
             
         except Exception as e:
-            print(f" Server execution failed: {type(e).__name__}: {str(e)}")
-            import traceback
-            traceback.print_exc()
+            print(f"Server execution failed: {type(e).__name__}: {str(e)}")
     else:
-        print("\n Use --start-server flag to run directly, or use the CLI command above.")
-        print("For production deployment, use the CLI with proper configuration files.")
+        print("Use --start-server flag to run directly")
 
 # === TIME ESTIMATION FUNCTIONS ===
 

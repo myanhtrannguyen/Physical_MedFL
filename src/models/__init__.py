@@ -5,27 +5,23 @@ Model components for medical image segmentation in federated learning.
 from .unet_model import (
     RobustMedVFL_UNet,
     CombinedLoss,
-    DiceLoss,
+    AdaptiveTvMFDiceLoss,
     PhysicsLoss,
     SmoothnessLoss,
     quantum_noise_injection,
     adaptive_spline_smoothing,
     ePURE,
-    MaxwellSolver,
-    compute_dice_score,
-    create_unified_data_loader
+    MaxwellSolver
 )
 
 __all__ = [
     'RobustMedVFL_UNet',
     'CombinedLoss',
-    'DiceLoss', 
+    'AdaptiveTvMFDiceLoss',
     'PhysicsLoss',
     'SmoothnessLoss',
     'quantum_noise_injection',
     'adaptive_spline_smoothing',
     'ePURE',
-    'MaxwellSolver',
-    'compute_dice_score',
-    'create_unified_data_loader'
+    'MaxwellSolver'
 ]

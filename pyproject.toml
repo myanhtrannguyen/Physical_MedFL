@@ -30,7 +30,9 @@ dependencies = [
     "matplotlib",
     "seaborn",
     "tqdm",
-    "pandas"
+    "pandas",
+    "toml",  # Added for config parsing
+    "psutil"  # Added for process detection
 ]
 
 
@@ -67,6 +69,13 @@ clientapp = "src.fl_core.app_client:app"
 serverapp = "src.fl_core.app_server:app"
 
 [tool.flwr.federations]
+default = "research"
 
-[tool.flwr.federations.local-simulation]
-options.num-supernodes = 2
+[tool.flwr.federations.research]
+options.num-supernodes = 1
+
+[tool.flwr.federations.scalable]
+options.num-supernodes = 5
+
+[tool.flwr.federations.production]
+options.num-supernodes = 50
