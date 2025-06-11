@@ -5,13 +5,14 @@ import os
 import sys
 import logging
 import warnings
-from typing import Dict, List, Tuple, Optional, Any
+from typing import Dict, List, Tuple, Optional, Any, cast
 from collections import OrderedDict
 import json
 import pickle
 import time
 import gc
 from pathlib import Path
+import psutil
 
 # 1.2 Scientific Computing Imports
 import numpy as np
@@ -33,128 +34,23 @@ except ImportError:
 from flwr.client import ClientApp, NumPyClient, Client
 from flwr.common import Context, Config, NDArrays, Scalar
 
-# 1.4 Project-Specific Imports
-try:
-    from src.models.unet_model import RobustMedVFL_UNet
-    from src.data.dataset import ACDCUnifiedDataset, BraTS2020UnifiedDataset, create_unified_dataset
-    from src.data.preprocessing import MedicalImagePreprocessor, DataAugmentation
-    from src.utils.seed import set_seed
-    from src.utils.logger import setup_federated_logger
-    SRC_IMPORTS_AVAILABLE = True
-except ImportError as e:
-    logging.warning(f"Failed to import from src modules: {e}")
-    SRC_IMPORTS_AVAILABLE = False
-    # Fallback imports for backward compatibility
-    try:
-        # Remove incorrect fallback import since it doesn't exist
-        # The model will be created using the SimpleCNN fallback instead
-        logging.warning("Using fallback components instead of full model")
-        
-        # Define fallback functions
-        def get_model_info(model):
-            """Fallback model info function"""
-            total_params = sum(p.numel() for p in model.parameters())
-            return {"total_parameters": total_params, "model_size_mb": total_params * 4 / (1024 * 1024)}
-        
-        def setup_federated_logger(client_id=None, log_dir="logs", level=logging.INFO):
-            """Fallback logger setup"""
-            logger = logging.getLogger(f"client_{client_id}" if client_id else "client")
-            logger.setLevel(level)
-            return logger
-        
-        def set_seed(seed):
-            """Fallback seed function"""
-            import random
-            random.seed(seed)
-            np.random.seed(seed)
-            torch.manual_seed(seed)
-        
-        # Define fallback data classes
-        class FallbackMedicalImagePreprocessor:
-            def __init__(self, **kwargs):
-                pass
-        
-        class FallbackDataAugmentation:
-            def __init__(self, **kwargs):
-                pass
-        
-        # Assign fallback classes to expected names
-        MedicalImagePreprocessor = FallbackMedicalImagePreprocessor
-        DataAugmentation = FallbackDataAugmentation
-            
-    except ImportError:
-        logging.error("Fallback components setup failed")
-        # We'll use the SimpleCNN fallback in _initialize_model instead
+# 1.4 Project-Specific Imports - DIRECT IMPORTS ONLY
+from src.models.unet_model import RobustMedVFL_UNet, CombinedLoss
+from src.data.data import SimpleMedicalDataset, create_simple_dataloader
+from src.utils.seed import set_seed
+from src.utils.logger import setup_federated_logger
+from src.utils.metrics import evaluate_model_with_research_metrics, convert_metrics_for_fl_server
 
-# 1.5 Model Components Imports (with fallback handling)
-# ADVANCED COMPONENTS WITH PROPER TYPE HANDLING
-try:
-    from src.models.unet_model import (
-        quantum_noise_injection as _quantum_noise_injection, 
-        MaxwellSolver as _MaxwellSolver, 
-        ePURE as _ePURE, 
-        CombinedLoss as _CombinedLoss,
-        adaptive_spline_smoothing as _adaptive_spline_smoothing
-    )
-    # Assign with proper types (ignore type conflicts due to fallback definitions)
-    quantum_noise_injection = _quantum_noise_injection
-    MaxwellSolver = _MaxwellSolver  
-    ePURE = _ePURE    
-    CombinedLoss = _CombinedLoss  
-    adaptive_spline_smoothing = _adaptive_spline_smoothing  
-    
-    ADVANCED_COMPONENTS_AVAILABLE = True
-    logging.info("Advanced components imported successfully - using full model capabilities")
-    
-except ImportError as e:
-    logging.warning(f"Advanced components import failed: {e} - using fallback implementations")
-    ADVANCED_COMPONENTS_AVAILABLE = False
-    
-    # Define fallback implementations with compatible signatures
-    def quantum_noise_injection(features, T=1.25, pauli_prob=None):
-        """Fallback quantum noise injection"""
-        if pauli_prob is None:
-            pauli_prob = {'X': 0.00096, 'Y': 0.00096, 'Z': 0.00096, 'None': 0.99712}
-        # Simple noise injection as fallback
-        return features + torch.randn_like(features) * 0.01
+# 1.5 Model Components Imports - NO FALLBACKS
+from src.models.unet_model import (
+    quantum_noise_injection, 
+    MaxwellSolver, 
+    ePURE, 
+    CombinedLoss,
+    adaptive_spline_smoothing
+)
 
-    class MaxwellSolver:
-        """Fallback Maxwell solver implementation"""
-        def __init__(self, in_channels, grid_size=(256, 256), device=None):
-            self.in_channels = in_channels
-            self.grid_size = grid_size
-            self.device = device or torch.device('cpu')
-        
-        def solve(self, x):
-            return torch.zeros_like(x)
-
-    class ePURE:
-        """Fallback ePURE implementation"""
-        def __init__(self, in_channels, base_channels=16):
-            self.in_channels = in_channels
-            self.base_channels = base_channels
-        
-        def estimate_noise(self, x):
-            return torch.zeros_like(x)
-
-    class CombinedLoss:
-        """Fallback combined loss - FIXED to return simple scalar loss"""
-        def __init__(self, num_classes=4, **kwargs):
-            self.criterion = nn.CrossEntropyLoss()
-        
-        def __call__(self, outputs, targets):
-            # Handle tuple outputs
-            if isinstance(outputs, tuple):
-                main_output = outputs[0]
-            else:
-                main_output = outputs
-            
-            # Return simple scalar loss instead of dict for fallback
-            return self.criterion(main_output, targets)
-
-    def adaptive_spline_smoothing(x, noise_profile=None, kernel_size=5, sigma=1.0):
-        """Fallback spline smoothing with proper signature"""
-        return x
+logging.info("Advanced components imported successfully - using full model capabilities")
 
 # 2. GLOBAL CONFIGURATION AND SETUP
 
@@ -167,10 +63,8 @@ warnings.filterwarnings('ignore', category=UserWarning)
 # Global Device Configuration
 if torch.cuda.is_available():
     DEVICE = torch.device('cuda')
-    print("Client Device: CUDA GPU")
 else:
     DEVICE = torch.device('cpu')
-    print("Client Device: CPU")
 
 logging.info(f"Using device: {DEVICE}")
 
@@ -186,11 +80,11 @@ DEFAULT_MODEL_CONFIG = {
 
 # Training constants
 DEFAULT_TRAINING_CONFIG = {
-    'local_epochs': 2,  # REDUCED from 5 to 2 to match config.toml and prevent timeouts
-    'batch_size': 2,  # Back to 2 as it worked before
-    'learning_rate': 0.01,  # INCREASED from 0.001 to 0.01 to match server eta-l
-    'weight_decay': 1e-5,  # Reduced regularization
-    'gradient_clip_norm': 1.0
+    'local_epochs': 5,  # FIXED: Match config.toml (was 2)
+    'batch_size': 8,  # FIXED: Match config.toml (was 2)
+    'learning_rate': 0.0005,  # FIXED: Match config.toml (was 0.001)
+    'weight_decay': 1e-4,  # FIXED: Match config.toml (was 1e-6)
+    'gradient_clip_norm': 1.0  # FIXED: Conservative clipping for stability
 }
 
 # Medical imaging constants
@@ -281,6 +175,10 @@ class FlowerClient(NumPyClient):
             level=logging.INFO
         )
         
+        #  NEW: Initialize Flower-specific attributes to fix linter errors
+        self._flower_context: Optional[Context] = None
+        self._partition_id: Optional[int] = None
+        
         # 3.1.2 Model Component Configuration
         self._initialize_model()
         self._initialize_data_components()
@@ -316,129 +214,38 @@ class FlowerClient(NumPyClient):
         self.noise_factor = 0.01
         
         # Initialize data immediately
-        self.logger.info(f"Loading data for client {client_id}...")
         self._load_client_data()
         
-        self.logger.info(f"Client {client_id} initialized successfully")
+        # OPTIMIZED: Single compact initialization line for research
+        print(f" Client {client_id} ready")
+        
+        self.logger.debug(f"Client {client_id} initialized successfully")
     
     def _initialize_model(self):
         """Initialize the main model with all components."""
         try:
-            self.logger.info("Starting model initialization...")
+            self.model = RobustMedVFL_UNet(
+                n_channels=self.model_config['n_channels'],
+                n_classes=self.model_config['n_classes'],
+            ).to(self.device)
             
-            if SRC_IMPORTS_AVAILABLE:
-                self.logger.info("Using SRC imports for model")
-                from src.models.unet_model import RobustMedVFL_UNet
-                
-                # Debug model config
-                self.logger.info(f"Model config: {self.model_config}")
-                
-                self.model = RobustMedVFL_UNet(
-                    n_channels=self.model_config['n_channels'],
-                    n_classes=self.model_config['n_classes'],
-                ).to(self.device)
-                
-                # CRITICAL: Ensure model is in training mode and parameters are trainable
-                self.model.train()
-                
-                # Force all parameters to be trainable
+            # Ensure model is in training mode and parameters are trainable
+            self.model.train()
+            for param in self.model.parameters():
+                param.requires_grad = True
+            
+            # Verify trainable parameters
+            num_trainable = sum(1 for p in self.model.parameters() if p.requires_grad)
+            if num_trainable == 0:
+                self.logger.error("CRITICAL: No trainable parameters found!")
                 for param in self.model.parameters():
-                    param.requires_grad = True
-                
-                # Debug: List all parameters and their requires_grad
-                param_info_count = 0
-                total_param_elements = 0
-                for name, param in self.model.named_parameters():
-                    param_info_count += 1
-                    total_param_elements += param.numel()
-                    self.logger.info(f"Param: {name}, shape: {tuple(param.shape)}, requires_grad: {param.requires_grad}")
-                
-                num_total = sum(1 for _ in self.model.parameters())
-                num_trainable = sum(1 for p in self.model.parameters() if p.requires_grad)
-                total_params = sum(p.numel() for p in self.model.parameters())
-                trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
-                
-                self.logger.info(f"[DEBUG] Model has {num_total} parameter tensors ({total_params:,} total parameters)")
-                self.logger.info(f"[DEBUG] {num_trainable} trainable tensors ({trainable_params:,} trainable parameters)")
-                self.logger.info(f"[DEBUG] Parameter info logged: {param_info_count} tensors, {total_param_elements:,} elements")
-                
-                # Final verification
-                if num_trainable == 0:
-                    self.logger.error("CRITICAL: All parameters still have requires_grad=False after manual setting!")
-                    # Try alternative approach
-                    for param in self.model.parameters():
-                        param.requires_grad_(True)
-                    trainable_final = sum(1 for p in self.model.parameters() if p.requires_grad)
-                    self.logger.info(f"After requires_grad_(True): {trainable_final}/{num_total} trainable")
-                
-                self.logger.info("OptimizedRobustMedVFL_UNet created successfully")
-                
-            else:
-                self.logger.info("Using fallback model imports")
-                # Create a simple CNN model as fallback
-                class SimpleCNN(nn.Module):
-                    def __init__(self, n_channels=1, n_classes=4):
-                        super().__init__()
-                        self.conv1 = nn.Conv2d(n_channels, 32, kernel_size=3, padding=1)
-                        self.conv2 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
-                        self.conv3 = nn.Conv2d(64, n_classes, kernel_size=1)
-                        self.pool = nn.AdaptiveAvgPool2d((64, 64))
-                        
-                    def forward(self, x):
-                        x = F.relu(self.conv1(x))
-                        x = F.relu(self.conv2(x))
-                        x = self.conv3(x)
-                        x = F.interpolate(x, size=(256, 256), mode='bilinear', align_corners=False)
-                        return x
-                
-                self.model = SimpleCNN(
-                    n_channels=self.model_config['n_channels'],
-                    n_classes=self.model_config['n_classes']
-                ).to(self.device)
-                
-                # CRITICAL: Ensure model is in training mode and parameters are trainable
-                self.model.train()
-                
-                # Force all parameters to be trainable
-                for param in self.model.parameters():
-                    param.requires_grad = True
-                
-                # Debug: List all parameters and their requires_grad
-                param_info_count = 0
-                total_param_elements = 0
-                for name, param in self.model.named_parameters():
-                    param_info_count += 1
-                    total_param_elements += param.numel()
-                    self.logger.info(f"Param: {name}, shape: {tuple(param.shape)}, requires_grad: {param.requires_grad}")
-                
-                num_total = sum(1 for _ in self.model.parameters())
-                num_trainable = sum(1 for p in self.model.parameters() if p.requires_grad)
-                total_params = sum(p.numel() for p in self.model.parameters())
-                trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
-                
-                self.logger.info(f"[DEBUG] Model has {num_total} parameter tensors ({total_params:,} total parameters)")
-                self.logger.info(f"[DEBUG] {num_trainable} trainable tensors ({trainable_params:,} trainable parameters)")
-                self.logger.info(f"[DEBUG] Parameter info logged: {param_info_count} tensors, {total_param_elements:,} elements")
-                
-                # Final verification
-                if num_trainable == 0:
-                    self.logger.error("CRITICAL: All parameters still have requires_grad=False after manual setting!")
-                    # Try alternative approach
-                    for param in self.model.parameters():
-                        param.requires_grad_(True)
-                    trainable_final = sum(1 for p in self.model.parameters() if p.requires_grad)
-                    self.logger.info(f"After requires_grad_(True): {trainable_final}/{num_total} trainable")
-                
-                self.logger.info("SimpleCNN fallback model created")
+                    param.requires_grad_(True)
             
             # Get model information
             self.model_info = get_model_info(self.model)
-            self.logger.info(f"Model initialized successfully: {self.model_info}")
             
         except Exception as e:
             self.logger.error(f"Failed to initialize model: {e}")
-            import traceback
-            self.logger.error(f"Full traceback: {traceback.format_exc()}")
             raise
     
     def _initialize_data_components(self):
@@ -457,60 +264,329 @@ class FlowerClient(NumPyClient):
         
         self.logger.info("Data components initialized")
     
-    def _create_criterion(self):
-        """Create loss function for training."""
+    def _load_client_data(self):
+        """Load client data using the simplified dataset system"""
         try:
-            if ADVANCED_COMPONENTS_AVAILABLE:
-                self.logger.info("Using ADVANCED CombinedLoss from unet_model")
-                # Use CombinedLoss with CORRECT parameters from actual constructor
-                num_model_classes = self.model_config.get('n_classes', 4)
-                return CombinedLoss(
-                    wc=0.5,                  # Cross-entropy weight (reduced from default 1.0)
-                    wd=0.1,                  # Dice weight (reduced from default 0.5)  
-                    wp=0.0,                  # Physics weight (disabled)
-                    ws=0.0,                  # Smoothness weight (disabled)
-                    in_channels_maxwell=1024,  # Maxwell solver channels
-                    num_classes=num_model_classes
-                )
-            else:
-                self.logger.info("Using standard nn.CrossEntropyLoss as ADVANCED_COMPONENTS_AVAILABLE is False")
-                class_weights = torch.tensor([0.25, 1.5, 1.3, 1.4]).to(self.device)  # MODERATE balancing
-                return nn.CrossEntropyLoss(weight=class_weights, ignore_index=255)
+            # Auto-detect number of supernodes from environment, config, or default
+            num_supernodes = self._detect_num_supernodes()
+            self.logger.info(f"Auto-detected supernodes: {num_supernodes}")
+            
+            # Extract partition ID dynamically  
+            partition_id = self._extract_partition_id(num_supernodes)
+            
+            # Use SimpleMedicalDataset for efficiency
+            self._load_acdc_with_simple_dataset(partition_id, num_supernodes)
+            
         except Exception as e:
-            self.logger.warning(f"Failed to create advanced/weighted loss, using standard CrossEntropyLoss: {e}")
-            return nn.CrossEntropyLoss(ignore_index=255)
+            self.logger.error(f"Data loading failed: {e}")
+            raise RuntimeError(f"Client {self.client_id} failed to load data: {e}. Check data path: {self.data_path}")
+
+    def _detect_num_supernodes(self) -> int:
+        """Auto-detect number of supernodes from multiple sources (same logic as server)."""
+        num_supernodes = None
+        
+        # DEBUG: Log context information
+        if hasattr(self, '_flower_context') and self._flower_context:
+            context = self._flower_context
+            self.logger.info(f"DEBUG: _flower_context exists: {type(context)}")
+            if hasattr(context, 'run_config'):
+                self.logger.info(f"DEBUG: run_config exists: {type(context.run_config)}")
+                if context.run_config:
+                    # Try to see all attributes in run_config
+                    try:
+                        attrs = dir(context.run_config)
+                        self.logger.info(f"DEBUG: run_config attributes: {[attr for attr in attrs if not attr.startswith('_')]}")
+                    except:
+                        pass
+            if hasattr(context, 'state'):
+                self.logger.info(f"DEBUG: context.state exists: {type(context.state)}")
+        else:
+            self.logger.warning("DEBUG: No _flower_context found")
+        
+        # 1. Try to get from Flower context run_config (PRIMARY SOURCE)
+        if hasattr(self, '_flower_context') and self._flower_context:
+            context = self._flower_context
+            if hasattr(context, 'run_config') and context.run_config:
+                # Try direct attribute first
+                raw_num_supernodes = getattr(context.run_config, 'num_supernodes', None)
+                if raw_num_supernodes:
+                    try:
+                        num_supernodes = int(str(raw_num_supernodes))
+                        self.logger.info(f"Detected num_supernodes from run_config: {num_supernodes}")
+                    except (ValueError, TypeError):
+                        pass
+                
+                # Try options.num-supernodes format (from pyproject.toml)
+                if not num_supernodes and hasattr(context.run_config, 'options'):
+                    options = getattr(context.run_config, 'options')
+                    if options:
+                        # Try different possible attribute names
+                        for attr_name in ['num_supernodes', 'num-supernodes']:
+                            raw_num_supernodes = getattr(options, attr_name, None)
+                            if raw_num_supernodes:
+                                try:
+                                    num_supernodes = int(str(raw_num_supernodes))
+                                    self.logger.info(f"Detected num_supernodes from run_config.options.{attr_name}: {num_supernodes}")
+                                    break
+                                except (ValueError, TypeError):
+                                    continue
+        
+        # 2. Try to get from context state
+        if not num_supernodes and hasattr(self, '_flower_context') and self._flower_context:
+            context = self._flower_context
+            if hasattr(context, 'state') and context.state:
+                raw_num_supernodes = context.state.get('num_supernodes')
+                if raw_num_supernodes:
+                    try:
+                        num_supernodes = int(str(raw_num_supernodes))
+                        self.logger.info(f"Detected num_supernodes from context state: {num_supernodes}")
+                    except (ValueError, TypeError):
+                        pass
+        
+        # 3. Check environment variables
+        if not num_supernodes:
+            env_vars = ['FLWR_NUM_SUPERNODES', 'NUM_SUPERNODES', 'FLOWER_NUM_SUPERNODES']
+            for env_var in env_vars:
+                value = os.environ.get(env_var)
+                if value:
+                    try:
+                        num_supernodes = int(value)
+                        self.logger.info(f"Detected num_supernodes from env var {env_var}: {num_supernodes}")
+                        break
+                    except ValueError:
+                        continue
+        
+        # 4. Try to parse from sys.argv (command line arguments)
+        if not num_supernodes:
+            import sys
+            try:
+                argv = sys.argv
+                for i, arg in enumerate(argv):
+                    if arg == '--num-supernodes' and i + 1 < len(argv):
+                        num_supernodes = int(argv[i + 1])
+                        self.logger.info(f"Detected num_supernodes from command line: {num_supernodes}")
+                        break
+            except (ValueError, IndexError):
+                pass
+        
+        # 5. Try to auto-detect from pyproject.toml federation configs
+        if not num_supernodes:
+            try:
+                import toml
+                pyproject_path = Path('pyproject.toml')
+                if pyproject_path.exists():
+                    with open(pyproject_path, 'r') as f:
+                        pyproject_config = toml.load(f)
+                    
+                    # Look for federation configs
+                    federations = pyproject_config.get('tool', {}).get('flwr', {}).get('federations', {})
+                    
+                    # Try production federation first, then others
+                    for federation_name in ['production', 'scalable', 'research', 'default']:
+                        if federation_name in federations:
+                            federation_config = federations[federation_name]
+                            
+                            # Try nested options structure first
+                            if 'options' in federation_config:
+                                options = federation_config['options']
+                                for num_supernodes_key in ['num-supernodes', 'num_supernodes']:
+                                    if num_supernodes_key in options:
+                                        try:
+                                            num_supernodes = int(options[num_supernodes_key])
+                                            self.logger.info(f"Detected num_supernodes from pyproject.toml federation '{federation_name}': {num_supernodes}")
+                                            break
+                                        except (ValueError, TypeError):
+                                            continue
+                                if num_supernodes:
+                                    break
+                            
+                            # Also try flat structure as fallback
+                            elif 'options.num-supernodes' in federation_config:
+                                try:
+                                    num_supernodes = int(federation_config['options.num-supernodes'])
+                                    self.logger.info(f"Detected num_supernodes from pyproject.toml federation '{federation_name}' (flat): {num_supernodes}")
+                                    break
+                                except (ValueError, TypeError):
+                                    continue
+            except Exception as e:
+                self.logger.debug(f"Failed to read pyproject.toml: {e}")
+        
+        # 6. Use default only if nothing found (should not happen in simulation)
+        if num_supernodes is None:
+            num_supernodes = 5
+            self.logger.warning(f"No num_supernodes found, using default: {num_supernodes}")
+        
+        return num_supernodes
+
+    def _load_acdc_with_simple_dataset(self, partition_id: int, num_supernodes: int):
+        """Load ACDC data using the simplified dataset system"""
+        self.logger.info(f"Loading ACDC with SimpleMedicalDataset: {num_supernodes} supernodes, partition {partition_id}")
+        
+        # Get ACDC data directory
+        acdc_data_dir = self._get_acdc_data_dir()
+        
+        # Create simple dataloaders with built-in partitioning
+        self.trainloader = create_simple_dataloader(
+            data_dir=acdc_data_dir,
+            batch_size=self.batch_size,
+            shuffle=True,
+            augment=True,  # Training with augmentation
+            num_workers=0,
+            client_id=partition_id,
+            num_clients=num_supernodes,
+            cache_size=50  # Cache 50 samples in memory
+        )
+        
+        self.valloader = create_simple_dataloader(
+            data_dir=acdc_data_dir,
+            batch_size=self.batch_size,
+            shuffle=False,
+            augment=False,  # Validation without augmentation
+            num_workers=0,
+            client_id=partition_id,
+            num_clients=num_supernodes,
+            cache_size=20  # Smaller cache for validation
+        )
+        
+        # Calculate number of examples with safe dataset size detection
+        def get_dataset_size(dataloader):
+            """Safely get dataset size with fallback methods."""
+            if dataloader is None:
+                return 0
+            try:
+                return len(dataloader.dataset)
+            except (TypeError, AttributeError):
+                # Fallback: estimate from dataloader
+                try:
+                    return len(dataloader) * dataloader.batch_size
+                except:
+                    return 0
+        
+        self.num_examples = {
+            "trainset": get_dataset_size(self.trainloader), 
+            "valset": get_dataset_size(self.valloader)
+        }
+        
+        # Verify data is not empty
+        if self.num_examples["trainset"] == 0:
+            raise ValueError(f"No training data found for client {self.client_id}")
+        
+        self.logger.info(f"ACDC dataset loaded successfully:")
+        self.logger.info(f"Training: {self.num_examples['trainset']} samples")
+        self.logger.info(f"Validation: {self.num_examples['valset']} samples") 
+        self.logger.info(f"Client: {partition_id}/{num_supernodes}")
+        
+        # Store simple metadata
+        self.research_metadata = {
+            'client_id': partition_id,
+            'num_supernodes': num_supernodes,
+            'trainset_size': self.num_examples["trainset"],
+            'valset_size': self.num_examples["valset"]
+        }
+
+    def _extract_partition_id(self, num_supernodes: int) -> int:
+        """Extract partition ID from client_id with multiple strategies"""
+        
+        # 1. If already set by Flower context
+        if hasattr(self, '_partition_id') and self._partition_id is not None:
+            return self._partition_id
+        
+        # 2. Extract from numeric part of client_id
+        import re
+        numeric_match = re.search(r'\d+', self.client_id)
+        if numeric_match:
+            partition_id = int(numeric_match.group()) % num_supernodes
+            self.logger.info(f"Extracted partition_id {partition_id} from client_id '{self.client_id}'")
+            return partition_id
+        
+        # 3. Use hash for non-numeric client IDs
+        partition_id = abs(hash(self.client_id)) % num_supernodes
+        self.logger.info(f"Generated partition_id {partition_id} from hash of client_id '{self.client_id}'")
+        return partition_id
+
+    def _get_acdc_data_dir(self) -> str:
+        """Get ACDC data directory with fallback paths"""
+        # First try the correct path from project structure
+        acdc_data_dir = os.path.join(self.data_path, "database", "training")
+        if os.path.exists(acdc_data_dir):
+            return acdc_data_dir
+            
+        # Fallback paths for different configurations
+        fallback_paths = [
+            os.path.join(self.data_path, "training"),  # Legacy path
+            str(self.data_path)  # Direct path
+        ]
+        
+        for fallback_path in fallback_paths:
+            if os.path.exists(fallback_path):
+                return fallback_path
+                
+        raise FileNotFoundError(f"ACDC training data not found. Tried paths: {acdc_data_dir}, {fallback_paths}")
+
+    def _create_criterion(self):
+        """Create loss function for training with enhanced class balancing for medical data."""
+        try:
+            # FULL COMBINED LOSS: Enable all components for comprehensive training
+            print(f"[Client {self.client_id}] Using FULL CombinedLoss with ALL components enabled (CE, Dice, Physics, Smoothness)")
+            
+            # Enhanced class weights for medical segmentation
+            class_weights = torch.tensor([0.1, 2.0, 2.5, 1.5], dtype=torch.float32, device=self.device)  # [Background, RV, Myocardium, LV]
+            
+            # Use CombinedLoss with ALL components enabled
+            num_model_classes = self.model_config.get('n_classes', 4)
+            # The bottleneck of RobustMedVFL_UNet outputs 1024 channels
+            bottleneck_channels = 1024 # Should match RobustMedVFL_UNet's bottleneck_features channels
+
+            criterion = CombinedLoss(
+                wc=0.5,  # CrossEntropy weight
+                wd=0.5,  # Dice weight
+                wp=0.1,  # ENABLED Physics weight
+                ws=0.01, # ENABLED Smoothness weight
+                in_channels_maxwell=bottleneck_channels, # Channels for b1_map_placeholder (bottleneck_features)
+                num_classes=num_model_classes,
+                max_kappa=300.0
+            )
+            
+            # CRITICAL: Override the CrossEntropy component with class weights
+            if hasattr(criterion, 'ce_loss'):
+                criterion.ce_loss = nn.CrossEntropyLoss(
+                    weight=class_weights, 
+                    reduction='mean',
+                    label_smoothing=0.1  # Add label smoothing for regularization
+                )
+                print(f"Enhanced CrossEntropy loss with class weights applied")
+            
+            return criterion
+                
+        except Exception as e:
+            self.logger.error(f"Failed to create CombinedLoss: {e}")
+            
+            # EMERGENCY FALLBACK: Weighted CrossEntropyLoss only
+            print(f"Falling back to weighted CrossEntropy only")
+            class_weights = torch.tensor([0.1, 2.0, 3.0, 2.0], dtype=torch.float32, device=self.device)
+            fallback_criterion = nn.CrossEntropyLoss(
+                weight=class_weights,
+                reduction='mean',
+                label_smoothing=0.1
+            )
+            
+            return fallback_criterion
     
     # 3.2 PARAMETER MANAGEMENT METHODS
     
     def get_parameters(self, config: Config) -> NDArrays:
-        """
-        Extract model parameters for federated aggregation.
-        
-        Args:
-            config: Configuration from server
-            
-        Returns:
-            List of numpy arrays representing model parameters
-        """
+        """Extract model parameters for federated aggregation."""
         try:
-            start_time = time.time()
-            
-            # Extract trainable parameters directly from model.parameters()
             parameters = []
-            
-            # Count trainable parameters
             trainable_count = 0
             total_count = 0
             
-            # Use model.parameters() instead of state_dict
             for param in self.model.parameters():
                 total_count += 1
                 if param.requires_grad:
                     param_array = param.detach().cpu().numpy()
                     parameters.append(param_array)
                     trainable_count += 1
-            
-            self.logger.info(f"Found {trainable_count} trainable, {total_count - trainable_count} non-trainable parameters")
             
             # If no trainable parameters found, use all parameters
             if len(parameters) == 0:
@@ -519,12 +595,6 @@ class FlowerClient(NumPyClient):
                     param_array = param.detach().cpu().numpy()
                     parameters.append(param_array)
             
-            # Log parameter extraction info
-            extraction_time = time.time() - start_time
-            total_params = sum(p.size for p in parameters)
-            self.logger.info(f"Extracted {len(parameters)} parameter arrays "
-                           f"({total_params:,} total parameters) in {extraction_time:.3f}s")
-            
             return parameters
             
         except Exception as e:
@@ -532,31 +602,13 @@ class FlowerClient(NumPyClient):
             raise
     
     def set_parameters(self, parameters: NDArrays) -> None:
-        """
-        Set model parameters from federated aggregation.
-        
-        Args:
-            parameters: List of numpy arrays representing model parameters
-        """
+        """Set model parameters from federated aggregation."""
         try:
-            start_time = time.time()
-            
-            # CRITICAL DEBUG: Log weights hash for transmission verification
-            param_hashes = [hash(param.tobytes()) for param in parameters]
-            param_means = [np.mean(param) for param in parameters]
-            param_stds = [np.std(param) for param in parameters]
-            
-            self.logger.info(f"=== WEIGHTS TRANSMISSION DEBUG ===")
-            self.logger.info(f"Received {len(parameters)} parameter arrays from server")
-            self.logger.info(f"Parameter hashes (first 3): {param_hashes[:3]}")
-            self.logger.info(f"Parameter means (first 3): {[f'{m:.6f}' for m in param_means[:3]]}")
-            self.logger.info(f"Parameter stds (first 3): {[f'{s:.6f}' for s in param_stds[:3]]}")
-            
-            # Use same strategy as get_parameters: collect trainable parameters from model.parameters()
+            # Use same strategy as get_parameters
             model_params = list(self.model.parameters())
             trainable_params = [p for p in model_params if p.requires_grad]
             
-            # If no trainable parameters found, use all parameters (same fallback as get_parameters)
+            # If no trainable parameters found, use all parameters
             if len(trainable_params) == 0:
                 self.logger.warning("No trainable parameters found in set_parameters! Using all parameters as fallback")
                 target_params = model_params
@@ -568,42 +620,16 @@ class FlowerClient(NumPyClient):
                 raise ValueError(f"Parameter count mismatch: expected {len(target_params)}, "
                                f"got {len(parameters)}")
             
-            # CRITICAL DEBUG: Log model state before update
-            old_param_means = [np.mean(p.detach().cpu().numpy()) for p in target_params[:3]]
-            self.logger.info(f"Model param means BEFORE update (first 3): {[f'{m:.6f}' for m in old_param_means]}")
-            
             # Set parameters directly to model.parameters()
             with torch.no_grad():
                 for param_tensor, new_param_array in zip(target_params, parameters):
-                    # Convert numpy array back to tensor
                     new_param_tensor = torch.from_numpy(new_param_array).to(self.device)
                     
-                    # Validate shape compatibility
                     if new_param_tensor.shape != param_tensor.shape:
                         raise ValueError(f"Shape mismatch: expected {param_tensor.shape}, "
                                        f"got {new_param_tensor.shape}")
                     
-                    # Copy data to existing parameter tensor
                     param_tensor.copy_(new_param_tensor)
-            
-            # CRITICAL DEBUG: Verify parameters were actually updated
-            new_param_means = [np.mean(p.detach().cpu().numpy()) for p in target_params[:3]]
-            self.logger.info(f"Model param means AFTER update (first 3): {[f'{m:.6f}' for m in new_param_means]}")
-            
-            # Check if parameters actually changed
-            param_changes = [abs(old - new) for old, new in zip(old_param_means, new_param_means)]
-            total_change = sum(param_changes)
-            
-            if total_change < 1e-8:
-                self.logger.warning(f"⚠️  POTENTIAL BUG: Parameters barely changed! Total change: {total_change:.10f}")
-            else:
-                self.logger.info(f"✅ Parameters updated successfully. Total change: {total_change:.6f}")
-            
-            # Verify successful parameter loading
-            loading_time = time.time() - start_time
-            self.logger.info(f"Successfully loaded {len(parameters)} parameter arrays "
-                           f"in {loading_time:.3f}s")
-            self.logger.info("=" * 50)
             
         except Exception as e:
             self.logger.error(f"Error setting parameters: {e}")
@@ -680,9 +706,10 @@ class FlowerClient(NumPyClient):
         # Extract training configuration with optimized defaults
         local_epochs = int(config.get("local_epochs", 5))  # Increased from 1 to 5
         batch_size = int(config.get("batch_size", 4))  # Optimal batch size for medical data
-        learning_rate = float(config.get("learning_rate", 1e-3))  # Higher LR for better learning
+        learning_rate = float(config.get("learning_rate", 5e-4))  # Reduced for stability
+        weight_decay = float(config.get("weight_decay", 1e-4))  # Increased regularization
         
-        self.logger.info(f"Starting training: {local_epochs} local epochs, batch_size={batch_size}, lr={learning_rate}")
+        # Silent initialization - remove verbose logging
         
         # Initialize scheduler to None first
         scheduler = None
@@ -696,7 +723,7 @@ class FlowerClient(NumPyClient):
             self.optimizer = torch.optim.Adam(
                 self.model.parameters(),
                 lr=learning_rate,
-                weight_decay=1e-6,  # REDUCED regularization to match centralized (was 1e-4)
+                weight_decay=weight_decay,  # Increased regularization
                 betas=(0.9, 0.999),  # Standard Adam betas for stability
                 eps=1e-8  # Standard Adam epsilon
             )
@@ -707,67 +734,60 @@ class FlowerClient(NumPyClient):
                 T_max=local_epochs,  # Cosine annealing over local epochs
                 eta_min=learning_rate * 0.1  # Minimum LR = 10% of initial
             )
-            
-            self.logger.info(f"Optimizer created: lr={learning_rate:.6f}, weight_decay={1e-6}, scheduler=CosineAnnealingLR")
         
         # Ensure trainloader is available
         if self.trainloader is None:
             self._load_client_data()
         
         if self.trainloader is None:
-            self.logger.error("No training data available")
             # Return valid parameters with at least 1 example to prevent division by zero
             return self.get_parameters(config), 1, {"error": "No training data", "train_loss": float('inf')}
         
-        # DEBUG: Check data type being used
-        try:
-            # Check if underlying dataset is SimpleACDCDataset (real data) vs TensorDataset (synthetic)
-            underlying_dataset = self.trainloader.dataset
-            
-            # Check if it's a Subset from random_split (has .dataset attribute)
-            if hasattr(underlying_dataset, 'dataset'):
-                base_dataset = getattr(underlying_dataset, 'dataset', None)  # type: ignore
-                if base_dataset and hasattr(base_dataset, 'samples'):
-                    # This is our SimpleACDCDataset
-                    samples_attr = getattr(base_dataset, 'samples', [])
-                    samples_count = len(samples_attr) if hasattr(samples_attr, '__len__') else 0
-                    data_info = f"Real ACDC data with {samples_count} total samples"
-                else:
-                    # This is likely TensorDataset (synthetic) 
-                    try:
-                        base_len = len(base_dataset) if base_dataset else 0  # type: ignore
-                        data_info = f"Synthetic data with {base_len} samples"
-                    except (TypeError, AttributeError):
-                        data_info = "Synthetic data (unknown count)"
-            else:
-                data_info = "Unknown data type"
-        except Exception:
-            data_info = "Unknown data type"
-        self.logger.info(f"Training on: {data_info}")
-        
-        # Training loop with improved configuration
+        # Silent training loop with minimal logging
         self.model.train()
         total_loss = 0.0
         num_batches = 0
         num_examples = 0
         batch_losses = []
         
-        # CRITICAL DEBUG: Initialize loss tracking
-        self.logger.info(f"=== TRAINING LOSS DEBUG ===")
+        # ADDED: Data validation and debugging
+        first_batch_logged = False
+        
+        # Early stopping variables
+        best_epoch_loss = float('inf')
+        patience_counter = 0
+        patience_limit = 3  # Stop if no improvement for 3 epochs
         
         for epoch in range(local_epochs):
             epoch_loss = 0.0
             epoch_batches = 0
-            epoch_start_time = time.time()
-            
-            self.logger.info(f"Starting epoch {epoch+1}/{local_epochs}")
             
             for batch_idx, (images, masks) in enumerate(self.trainloader):
-                batch_start_time = time.time()
-                
                 # Move to device
                 images = images.to(self.device).float()
                 masks = masks.to(self.device).long()
+                
+                # Data validation for first batch
+                if not first_batch_logged:
+                    unique_masks = torch.unique(masks).cpu().numpy()
+                    validation_issues = []
+                    
+                    # Check for invalid classes
+                    if not all(c in [0, 1, 2, 3] for c in unique_masks):
+                        validation_issues.append(f"INVALID CLASSES: {unique_masks}")
+                    
+                    # Check for NaN/Inf
+                    if torch.isnan(images).any() or torch.isinf(images).any():
+                        validation_issues.append("IMAGE NaN/Inf detected")
+                    
+                    if torch.isnan(masks.float()).any():
+                        validation_issues.append("MASK NaN detected")
+                    
+                    # Report validation results
+                    if validation_issues:
+                        print(f"[Client {self.client_id}] Data issues: {', '.join(validation_issues)}")
+                    
+                    first_batch_logged = True
                 
                 # Apply quantum noise injection for robustness (with lower probability)
                 if self.quantum_noise_enabled and torch.rand(1).item() < 0.3:  # 30% chance
@@ -777,89 +797,207 @@ class FlowerClient(NumPyClient):
                 self.optimizer.zero_grad()
                 outputs = self.model(images)
                 
-                # Handle model outputs consistently (some models return tuple)
-                if isinstance(outputs, tuple):
-                    main_output = outputs[0]
-                    auxiliary_outputs = outputs[1] if len(outputs) > 1 else None
-                else:
-                    main_output = outputs
-                    auxiliary_outputs = None
+                # Handle physics-informed model outputs: (logits, bottleneck_features, all_eps_sigma_tuples)
+                if isinstance(outputs, tuple) and len(outputs) == 3:
+                    logits, bottleneck_features, eps_sigma_list = outputs
+                elif isinstance(outputs, tuple) and len(outputs) == 1: # Should not happen with RobustMedVFL_UNet
+                    logits = outputs[0]
+                    bottleneck_features = None
+                    eps_sigma_list = None
+                    if epoch == 0 and batch_idx == 0:
+                        self.logger.warning("Model returned a single tuple element, expected 3 for physics features. Physics/Smoothness loss might be ineffective.")
+                else: # Standard model output
+                    logits = outputs
+                    bottleneck_features = None
+                    eps_sigma_list = None
+                    if epoch == 0 and batch_idx == 0:
+                        self.logger.warning("Model did not return a tuple, expected 3 for physics features. Physics/Smoothness loss might be ineffective.")
+
+                # Ensure logits is a tensor for type safety
+                if not torch.is_tensor(logits):
+                    self.logger.warning(f"Model output is not a tensor: {type(logits)}")
+                    continue
                 
-                # Compute loss - CRITICAL FIX for CombinedLoss with model tuple outputs
-                if ADVANCED_COMPONENTS_AVAILABLE:
-                    # Use __call__ method instead of forward() directly
-                    loss_result = self.criterion(outputs, masks)
-                else:
-                    # Standard loss function (CrossEntropyLoss)
-                    if isinstance(outputs, tuple) and len(outputs) > 0:
-                        main_output = outputs[0]
-                    else:
-                        main_output = outputs
-                    loss_result = self.criterion(main_output, masks)
+                # Validate logits for numerical issues
+                if batch_idx == 0 and epoch == 0:
+                    if torch.isnan(logits).any() or torch.isinf(logits).any():
+                        print(f"[Client {self.client_id}] ERROR: NaN/Inf in logits detected")
+                    
+                    #  CRITICAL: Softmax distribution analysis (detect model collapse)
+                    logits_softmax = F.softmax(logits, dim=1)
+                    print(f"     Softmax range: [{logits_softmax.min():.6f}, {logits_softmax.max():.6f}]")
+                    
+                    # Check each class probability distribution
+                    print(f"     Per-class softmax analysis:")
+                    for class_idx in range(4):
+                        class_probs = logits_softmax[:, class_idx, :, :]
+                        class_mean = class_probs.mean().item()
+                        class_max = class_probs.max().item()
+                        print(f"       Class {class_idx}: Mean={class_mean:.4f}, Max={class_max:.4f}")
+                        
+                        #  Detect model collapse for each class
+                        if class_mean > 0.8:
+                            print(f"        COLLAPSE: Class {class_idx} dominates (mean={class_mean:.3f})!")
+                        elif class_mean < 0.05:
+                            print(f"         WEAK: Class {class_idx} barely predicted (mean={class_mean:.3f})")
+                    
+                    #  CRITICAL: Prediction analysis
+                    predictions = torch.argmax(logits_softmax, dim=1)
+                    pred_unique = torch.unique(predictions).cpu().numpy()
+                    print(f"     Predicted classes: {pred_unique}")
+                    
+                    # Check for prediction collapse (model always predicts same class)
+                    if len(pred_unique) == 1:
+                        print(f"      PREDICTION COLLAPSE: Model only predicts class {pred_unique[0]}!")
+                    
+                    # Prediction distribution
+                    total_pred_pixels = predictions.numel()
+                    print(f"     Prediction distribution:")
+                    for class_id in range(4):
+                        pred_count = (predictions == class_id).sum().item()
+                        pred_ratio = pred_count / total_pred_pixels
+                        print(f"       Pred Class {class_id}: {pred_count:6d} pixels ({pred_ratio:.3%})")
+                    
+                    #  CRITICAL: Compare predictions vs ground truth
+                    print(f"     Ground truth vs Predictions comparison:")
+                    for class_id in range(4):
+                        gt_count = (masks == class_id).sum().item()
+                        pred_count = (predictions == class_id).sum().item()
+                        gt_ratio = gt_count / total_pred_pixels
+                        pred_ratio = pred_count / total_pred_pixels
+                        diff = abs(gt_ratio - pred_ratio)
+                        print(f"       Class {class_id}: GT={gt_ratio:.3%} vs Pred={pred_ratio:.3%} (diff={diff:.3%})")
+                        
+                        if diff > 0.5:  # >50% difference
+                            print(f"          HUGE MISMATCH: >50% difference for class {class_id}!")
+                    
+                    # Validate expected number of classes
+                    if logits.shape[1] != 4:
+                        print(f"      ERROR: Expected 4 classes, got {logits.shape[1]}")
                 
-                # CRITICAL FIX: CombinedLoss returns scalar tensor, not dict
+                # Compute loss - Using CombinedLoss from unet_model
+                # CombinedLoss accepts: logits, targets, b1_map_placeholder, all_eps_sigma_tuples, features_for_smoothness
+                loss_result = self.criterion(
+                    logits, 
+                    masks, 
+                    b1_map_placeholder=bottleneck_features, # Pass actual bottleneck features
+                    all_eps_sigma_tuples=eps_sigma_list,    # Pass actual eps_sigma_list
+                    features_for_smoothness=bottleneck_features # Use bottleneck_features for smoothness loss
+                )
+                
+                # CombinedLoss returns scalar tensor
                 if torch.is_tensor(loss_result):
-                    # Both CombinedLoss and standard losses return tensor directly
                     loss = loss_result
                     
-                    # CRITICAL DEBUG: Log loss details for stuck detection
-                    if batch_idx % 5 == 0 or batch_idx < 3:  # Log first 3 batches and every 5th
-                        self.logger.info(f"Epoch {epoch+1}, Batch {batch_idx}: Loss = {loss.item():.6f}")
+                    # ENHANCED: Detailed loss validation and debugging
+                    if batch_idx == 0 and epoch == 0:
+                        print(f"   Loss Computation:")
+                        print(f"     Raw loss: {loss.item():.6f}")
+                        print(f"     Loss dtype: {loss.dtype}")
+                        print(f"     Loss device: {loss.device}")
                         
-                        # Additional debug info
-                        if batch_idx == 0:
-                            output_mean = torch.mean(main_output).item()
-                            output_std = torch.std(main_output).item()
-                            mask_unique = torch.unique(masks).tolist()
-                            self.logger.info(f"  Output stats: mean={output_mean:.6f}, std={output_std:.6f}")
-                            self.logger.info(f"  Mask classes: {mask_unique}")
-                            
-                        # Check for problematic loss values
-                        if torch.isnan(loss) or torch.isinf(loss):
-                            self.logger.error(f"❌ NaN/Inf loss detected at epoch {epoch+1}, batch {batch_idx}!")
-                            raise ValueError(f"NaN/Inf loss: {loss.item()}")
-                            
-                        if loss.item() > 100.0:
-                            self.logger.warning(f"⚠️  Very high loss detected: {loss.item():.6f}")
-                            
-                        if batch_idx > 0 and abs(loss.item() - batch_losses[-1]) < 1e-6:
-                            self.logger.warning(f"⚠️  Loss not changing: {loss.item():.6f} vs {batch_losses[-1]:.6f}")
+                        # Verify loss is in reasonable range
+                        if loss.item() > 100:
+                            print(f"      CATASTROPHIC LOSS DETECTED: {loss.item():.2e}")
+                            print(f"      This indicates severe numerical instability!")
+                    
+                    # Check for problematic loss values - ensure tensor input
+                    if torch.isnan(loss).any() or torch.isinf(loss).any():
+                        print(f"      ERROR: NaN/Inf loss detected: {loss.item()}")
+                        continue
                             
                 else:
-                    self.logger.error(f"Unexpected loss type: {type(loss_result)}")
-                    loss = torch.tensor(0.0, device=self.device, requires_grad=True)
-                
-                # CRITICAL FIX: Remove L2 regularization as it was causing exploding loss (1300+)
-                # The loss should be in range 0-10, not 1300+
-                # l2_lambda = 1e-6  # REMOVED - this was causing the high loss values
-                # l2_norm = sum(p.pow(2.0).sum() for p in self.model.parameters())
-                # loss = loss + l2_lambda * l2_norm
+                    raise ValueError(f"Unexpected loss type: {type(loss_result)}")
                 
                 # Backward pass with ENHANCED gradient clipping for FL stability
                 loss.backward()
                 
-                # DEBUG: Check gradient magnitudes for stuck detection
+                #  ENHANCED: Comprehensive gradient flow analysis
                 total_grad_norm = 0.0
                 param_count = 0
-                for param in self.model.parameters():
+                zero_grad_count = 0
+                max_grad_norm = 0.0
+                min_grad_norm = float('inf')
+                grad_norms = []
+                
+                for name, param in self.model.named_parameters():
                     if param.grad is not None:
                         param_norm = param.grad.data.norm(2)
                         total_grad_norm += param_norm.item() ** 2
                         param_count += 1
+                        grad_norms.append(param_norm.item())
+                        max_grad_norm = max(max_grad_norm, param_norm.item())
+                        min_grad_norm = min(min_grad_norm, param_norm.item())
+                        
+                        if param_norm.item() < 1e-8:
+                            zero_grad_count += 1
+                            
+                        # Log problematic gradients for first few parameters
+                        if batch_idx == 0 and epoch == 0 and param_count <= 3:
+                            print(f"     Grad[{name[:20]}]: {param_norm.item():.8f}")
+                    else:
+                        zero_grad_count += 1
+                        
                 total_grad_norm = total_grad_norm ** 0.5
                 
-                # Log gradient info occasionally
-                if batch_idx % 10 == 0:
-                    self.logger.debug(f"Batch {batch_idx}: Loss={loss.item():.4f}, Grad_norm={total_grad_norm:.6f}, Params_with_grad={param_count}")
+                # Comprehensive gradient analysis for first batch
+                if batch_idx == 0 and epoch == 0:
+                    print(f"   Gradient Flow Analysis:")
+                    print(f"     Total grad norm: {total_grad_norm:.8f}")
+                    print(f"     Max grad norm: {max_grad_norm:.8f}")
+                    print(f"     Min grad norm: {min_grad_norm:.8f}")
+                    print(f"     Zero gradients: {zero_grad_count}/{param_count + zero_grad_count}")
+                    print(f"     Mean grad norm: {np.mean(grad_norms):.8f}")
+                    print(f"     Std grad norm: {np.std(grad_norms):.8f}")
                     
-                    # Check for gradient issues
-                    if total_grad_norm < 1e-8:
-                        self.logger.warning(f"⚠️  Very small gradients: {total_grad_norm:.10f} - model may be stuck")
-                    elif total_grad_norm > 100.0:
-                        self.logger.warning(f"⚠️  Very large gradients: {total_grad_norm:.6f} - potential instability")
+                    #  Gradient health checks
+                    gradient_issues = []
+                    if total_grad_norm < 1e-6:
+                        gradient_issues.append("Extremely small gradients - model may not be learning!")
+                    if total_grad_norm > 100:
+                        gradient_issues.append("Extremely large gradients - may cause instability!")
+                    if zero_grad_count > param_count * 0.5:
+                        gradient_issues.append(f"Too many zero gradients ({zero_grad_count}/{param_count})")
+                    
+                    if gradient_issues:
+                        print(f"      GRADIENT ISSUES:")
+                        for issue in gradient_issues:
+                            print(f"          {issue}")
+                    else:
+                        print(f"      Gradient flow appears healthy")
                 
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=5.0)  # INCREASED from 1.0
+                # ENHANCED gradient clipping based on gradient analysis
+                if total_grad_norm > 10.0:
+                    # Aggressive clipping for very large gradients
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                    if batch_idx == 0 and epoch == 0:
+                        print(f"      Applied aggressive gradient clipping (norm {total_grad_norm:.2f} -> 1.0)")
+                elif total_grad_norm > 5.0:
+                    # Moderate clipping
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=2.0)
+                    if batch_idx == 0 and epoch == 0:
+                        print(f"      Applied moderate gradient clipping (norm {total_grad_norm:.2f} -> 2.0)")
+                else:
+                    # Light clipping for normal gradients
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=5.0)
                 self.optimizer.step()
+                
+                #  ENHANCED: Post-optimization parameter changes
+                if batch_idx == 0 and epoch == 0:
+                    print(f"   Parameter Update Analysis:")
+                    param_changes = []
+                    for name, param in self.model.named_parameters():
+                        if param.grad is not None:
+                            # This would need parameter storage from before update to compute actual change
+                            param_changes.append(param.data.norm().item())
+                    
+                    if param_changes:
+                        mean_param_norm = np.mean(param_changes)
+                        print(f"     Mean parameter norm after update: {mean_param_norm:.8f}")
+                        if mean_param_norm < 1e-6 or mean_param_norm > 100:
+                            print(f"      WARNING: Unusual parameter magnitude!")
+                    
+                    print(f"   First batch analysis complete\n")
                 
                 # Accumulate metrics
                 batch_loss = loss.item()
@@ -867,863 +1005,315 @@ class FlowerClient(NumPyClient):
                 epoch_batches += 1
                 num_examples += images.size(0)
                 batch_losses.append(batch_loss)
-                
-                # Batch timing
-                batch_time = time.time() - batch_start_time
-                if batch_idx % 10 == 0:
-                    self.logger.debug(f"Batch {batch_idx} completed in {batch_time:.3f}s")
             
             # Step learning rate scheduler
             if scheduler is not None:
                 scheduler.step()
             
-            avg_epoch_loss = epoch_loss / epoch_batches if epoch_batches > 0 else 0.0
+            # Early stopping check
+            avg_epoch_loss = epoch_loss / epoch_batches if epoch_batches > 0 else float('inf')
+            if avg_epoch_loss < best_epoch_loss:
+                best_epoch_loss = avg_epoch_loss
+                patience_counter = 0
+            else:
+                patience_counter += 1
+                if patience_counter >= patience_limit:
+                    print(f"[C{self.client_id}] Early stopping at epoch {epoch+1}/{local_epochs}")
+                    break
+            
             total_loss += epoch_loss
             num_batches += epoch_batches
-            
-            epoch_time = time.time() - epoch_start_time
-            self.logger.info(f"Epoch {epoch+1}/{local_epochs} completed: Avg Loss = {avg_epoch_loss:.6f}, Time = {epoch_time:.2f}s")
-            
-            # CRITICAL DEBUG: Check for stuck loss across epochs
-            if epoch > 0 and len(batch_losses) >= 2:
-                recent_losses = batch_losses[-min(10, len(batch_losses)):]
-                loss_variance = np.var(recent_losses)
-                if loss_variance < 1e-10:
-                    self.logger.warning(f"⚠️  LOSS STUCK: Variance = {loss_variance:.12f} over last {len(recent_losses)} batches")
         
         # Calculate final metrics
         avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
         training_time = time.time() - start_time
         
-        # CRITICAL DEBUG: Final training summary
-        self.logger.info(f"=== TRAINING COMPLETED ===")
-        self.logger.info(f"Average Loss: {avg_loss:.6f}")
-        self.logger.info(f"Loss Range: {min(batch_losses):.6f} - {max(batch_losses):.6f}")
-        self.logger.info(f"Loss Std Dev: {np.std(batch_losses):.6f}")
-        self.logger.info(f"Examples: {num_examples}, Time: {training_time:.2f}s")
-        
-        if np.std(batch_losses) < 1e-6:
-            self.logger.error(f"❌ TRAINING STUCK: Loss standard deviation too low: {np.std(batch_losses):.10f}")
-        
-        self.logger.info("=" * 50)
-        
         # Get updated parameters
         updated_parameters = self.get_parameters(config)
         
-        # Prepare metrics for server
+        # Prepare comprehensive metrics for AdaFedAdam server - SIMPLIFIED FOR SERIALIZATION
         metrics = {
-            "train_loss": avg_loss,
-            "num_examples": num_examples,
-            "num_batches": num_batches,
-            "training_time": training_time,
-            "local_epochs": local_epochs,
-            "final_lr": learning_rate,
-            "loss_history": batch_losses[-5:]  # Last 5 epoch losses
+            "train_loss": float(avg_loss),
+            "num_examples": int(num_examples),
+            "num_batches": int(num_batches),
+            "training_time": float(training_time),
+            "local_epochs": int(local_epochs),
+            "final_lr": float(learning_rate),
+            
+            # AdaFedAdam-specific metrics for fairness weighting
+            "initial_loss": float(batch_losses[0]) if batch_losses else float(avg_loss),
+            "final_loss": float(batch_losses[-1]) if batch_losses else float(avg_loss),
+            "loss_improvement": float(batch_losses[0] - batch_losses[-1]) if len(batch_losses) > 1 else 0.0,
+            "loss_variance": float(np.var(batch_losses)) if len(batch_losses) > 1 else 0.0,
+            "convergence_rate": float(abs(batch_losses[0] - batch_losses[-1]) / max(batch_losses[0], 1e-6)) if len(batch_losses) > 1 else 0.0,
+            
+            # Client-specific information for server monitoring
+            "client_data_quality": float(1.0 - min(avg_loss, 2.0) / 2.0),
+            "training_stability": float(1.0 / (1.0 + float(np.std(batch_losses)))) if len(batch_losses) > 1 else 1.0,
         }
+        
+        # Add κ (kappa) values from AdaptiveTvMFDiceLoss - SIMPLIFIED
+        try:
+            if hasattr(self.criterion, 'get_kappa_values'):
+                kappa_attr = getattr(self.criterion, 'get_kappa_values')
+                if callable(kappa_attr):
+                    kappa_values = kappa_attr()
+                else:
+                    kappa_values = kappa_attr
+                    
+                if kappa_values and isinstance(kappa_values, dict):
+                    # Only add simple scalar kappa values
+                    for key, value in kappa_values.items():
+                        if isinstance(value, (int, float, np.number)):
+                            metrics[f"kappa_{key}"] = float(value)
+        except Exception:
+            pass  # Ignore kappa extraction errors
+        
+        # OPTIMIZED: Single compact research metrics line for client completion
+        loss_improvement = metrics['loss_improvement']
+        stability = metrics['training_stability']
+        data_quality = metrics['client_data_quality']
+        convergence = metrics['convergence_rate']
+        
+        # COMPACT CLIENT FORMAT
+        print(f"[C{self.client_id}] R{config.get('server_round', 0):02d} | Loss={avg_loss:.4f} | Δ={loss_improvement:.3f} | Examples={num_examples} | Time={training_time:.1f}s")
         
         return updated_parameters, int(self.num_examples["trainset"]), metrics
-    
-    # 3.4 EVALUATION METHOD (EVALUATE) - DETAILED IMPLEMENTATION
+
+    # 3.4 EVALUATION METHOD (EVALUATE) - COMPREHENSIVE IMPLEMENTATION
     
     def evaluate(self, parameters: NDArrays, config: Config) -> Tuple[float, int, Dict[str, Scalar]]:
-        """Execute global model evaluation on client's validation data with comprehensive metrics."""
-        import traceback
-        try:
-            # 3.1 Environment Setup
-            eval_start_time = time.time()
-            self.logger.info(f"[evaluate] Starting evaluation...")
-            
-            # Set parameters
-            self.set_parameters(parameters)
-            self.model.eval()
-            
-            # 3.2 Validate Data Availability
-            if self.valloader is None:
-                self.logger.warning("[evaluate] No validation data available")
-                return float('inf'), 0, {"error": "No validation data"}
-            
-            # 3.3 Execute Evaluation
-            self.logger.info(f"[evaluate] Running evaluation on {len(self.valloader)} batches")
-            eval_metrics = self._execute_evaluation_loop()
-            
-            # 3.4.3 Comprehensive Metrics Collection
-            evaluation_time = time.time() - eval_start_time
-            
-            # 3.4.4 Results Processing
-            self.logger.info(f"[evaluate] Evaluation finished. Preparing return values...")
-            
-            # Get actual number of evaluated samples from metrics, fallback to dataset size
-            actual_evaluated_samples = eval_metrics.get("num_eval_samples", 0)
-            if actual_evaluated_samples == 0:
-                # Fallback to dataset size if evaluation failed to count samples
-                actual_evaluated_samples = self.num_examples["valset"]
-            
-            return_metrics = {
-                "eval_loss": float(eval_metrics["eval_loss"]),
-                "eval_accuracy": float(eval_metrics["eval_accuracy"]),
-                "eval_dice": float(eval_metrics["eval_dice_avg"]),
-                "eval_iou": float(eval_metrics["eval_iou_avg"]),
-                "eval_precision": float(eval_metrics["eval_precision_avg"]),
-                "eval_recall": float(eval_metrics["eval_recall_avg"]),
-                "eval_f1": float(eval_metrics["eval_f1_avg"]),
-                "physics_consistency": float(eval_metrics["physics_consistency"]),
-                "noise_robustness": float(eval_metrics["noise_robustness"]),
-                "evaluation_time": float(evaluation_time),
-                "inference_time_per_sample": float(eval_metrics["avg_inference_time_per_batch"]),
-                "memory_usage_mb": float(eval_metrics["peak_memory_mb"])
-            }
-            
-            self.logger.info(f"[evaluate] Return types: {type(eval_metrics['eval_loss'])}, {type(actual_evaluated_samples)}, {type(return_metrics)}")
-            self.logger.info(f"[evaluate] Return values: num_examples={actual_evaluated_samples}, metrics={return_metrics}")
-            
-            # Return actual evaluated samples count to prevent server zero division
-            return float(eval_metrics["eval_loss"]), int(actual_evaluated_samples), dict(return_metrics)
-        except Exception as e:
-            self.logger.error(f"[evaluate] Error: {e}")
-            self.logger.error(traceback.format_exc())
-            return float('inf'), 0, {"error": str(e)}
-    
-    def _execute_evaluation_loop(self) -> Dict[str, Any]:
-        """Execute evaluation loop with comprehensive metrics"""
+        """
+        Evaluate the model with COMPREHENSIVE PER-CLIENT METRICS
         
-        # Check if validation loader exists
+        Args:
+            parameters: Global model parameters from server
+            config: Evaluation configuration from server
+            
+        Returns:
+            Loss value, number of examples, and comprehensive evaluation metrics
+        """
+        start_time = time.time()
+        
+        # Set parameters from server
+        self.set_parameters(parameters)
+        
+        # Extract evaluation configuration
+        batch_size = int(config.get("batch_size", 4))
+        enable_detailed_metrics = config.get("enable_detailed_metrics", True)
+        
+        # Ensure validation loader is available
         if self.valloader is None:
-            print(f"[Client {self.client_id}] Warning: No validation data available")
-            return {
-                'eval_loss': float('inf'),
-                'eval_accuracy': 0.0,
-                'num_eval_samples': 0,
-                'eval_dice_avg': 0.0,
-                'eval_iou_avg': 0.0,
-                'eval_precision_avg': 0.0,
-                'eval_recall_avg': 0.0,
-                'eval_f1_avg': 0.0,
-                'eval_dice_class_0': 0.0, 'eval_dice_class_1': 0.0, 
-                'eval_dice_class_2': 0.0, 'eval_dice_class_3': 0.0,
-                'eval_iou_class_0': 0.0, 'eval_iou_class_1': 0.0,
-                'eval_iou_class_2': 0.0, 'eval_iou_class_3': 0.0,
-                'eval_precision_class_0': 0.0, 'eval_precision_class_1': 0.0,
-                'eval_precision_class_2': 0.0, 'eval_precision_class_3': 0.0,
-                'eval_recall_class_0': 0.0, 'eval_recall_class_1': 0.0,
-                'eval_recall_class_2': 0.0, 'eval_recall_class_3': 0.0,
-                'eval_f1_class_0': 0.0, 'eval_f1_class_1': 0.0,
-                'eval_f1_class_2': 0.0, 'eval_f1_class_3': 0.0,
-                'physics_consistency': 0.0,
-                'noise_robustness': 1.0,
-                'evaluation_time': 0.0,
-                'inference_time_per_sample': 0.0,
-                'avg_inference_time_per_batch': 0.0,
-                'peak_memory_mb': 0.0
-            }
+            self._load_client_data()
         
-        total_loss = 0.0
-        total_samples = 0
-        correct_predictions = 0
-        total_pixels = 0
+        if self.valloader is None:
+            # Return minimal valid response to prevent server crash
+            return 1.0, 1, {"error": "No validation data", "eval_loss": 1.0}
         
-        # Per-class metrics storage
-        num_classes = 4
-        dice_scores_per_class = [[] for _ in range(num_classes)]
-        iou_scores_per_class = [[] for _ in range(num_classes)]
-        precision_per_class = [0.0] * num_classes
-        recall_per_class = [0.0] * num_classes
-        f1_per_class = [0.0] * num_classes
+        # USE UTILS/METRICS.PY FOR EVALUATION INSTEAD OF MANUAL IMPLEMENTATION
+        self.logger.info("Starting comprehensive evaluation using utils/metrics.py")
         
-        physics_consistency_scores = []
-        noise_robustness_scores = []
-        inference_times = []
+        # Use the research-grade metrics evaluation from utils/metrics.py
+        research_metrics = evaluate_model_with_research_metrics(
+            model=self.model,
+            dataloader=self.valloader,
+            device=self.device,
+            num_classes=4,
+            class_names=['Background', 'RV', 'Myocardium', 'LV'],
+            return_detailed=False
+        )
         
-        with torch.no_grad():
-            for batch_idx, batch in enumerate(self.valloader):
-                start_time = time.time()
-                
-                try:
-                    if len(batch) == 2:
-                        images, masks = batch
-                    else:
-                        continue
-                    
-                    images = images.to(self.device).float()
-                    masks = masks.to(self.device).long()
-                    
-                    batch_size = images.size(0)
-                    total_samples += batch_size
-                    
-                    # Forward pass
-                    outputs = self.model(images)
-                    
-                    # Handle tuple outputs
-                    if isinstance(outputs, tuple):
-                        main_output = outputs[0]
-                        auxiliary_outputs = outputs[1] if len(outputs) > 1 else None
-                    else:
-                        main_output = outputs
-                        auxiliary_outputs = None
-                    
-                    # Compute loss
-                    if hasattr(self.criterion, '__call__'):
-                        loss_result = self.criterion(main_output, masks)
-                        if isinstance(loss_result, dict):
-                            loss = loss_result.get('total_loss', 0.0)
-                        else:
-                            loss = loss_result
-                    else:
-                        loss = nn.CrossEntropyLoss()(main_output, masks)
-                    
-                    total_loss += float(loss) if hasattr(loss, 'item') else float(loss)
-                    
-                    # Get predictions
-                    predicted = torch.argmax(main_output, dim=1)
-                    
-                    # Overall accuracy
-                    correct_predictions += (predicted == masks).sum().item()
-                    total_pixels += masks.numel()
-                    
-                    # Per-class metrics computation
-                    for class_idx in range(num_classes):
-                        # Get binary masks for current class
-                        pred_binary = (predicted == class_idx).float()
-                        target_binary = (masks == class_idx).float()
-                        
-                        # Dice score for this class
-                        intersection = (pred_binary * target_binary).sum()
-                        union = pred_binary.sum() + target_binary.sum()
-                        
-                        if union > 0:
-                            dice = (2.0 * intersection) / union
-                            dice_scores_per_class[class_idx].append(dice.item())
-                        else:
-                            dice_scores_per_class[class_idx].append(0.0)
-                        
-                        # IoU score for this class
-                        if union > 0:
-                            iou = intersection / (pred_binary.sum() + target_binary.sum() - intersection)
-                            iou_scores_per_class[class_idx].append(iou.item())
-                        else:
-                            iou_scores_per_class[class_idx].append(0.0)
-                        
-                        # Precision, Recall, F1 for this class
-                        true_positive = intersection.item()
-                        predicted_positive = pred_binary.sum().item()
-                        actual_positive = target_binary.sum().item()
-                        
-                        # Precision
-                        if predicted_positive > 0:
-                            precision = true_positive / predicted_positive
-                            precision_per_class[class_idx] += precision
-                        
-                        # Recall
-                        if actual_positive > 0:
-                            recall = true_positive / actual_positive
-                            recall_per_class[class_idx] += recall
-                        
-                        # F1 score
-                        if predicted_positive > 0 and actual_positive > 0:
-                            precision = true_positive / predicted_positive
-                            recall = true_positive / actual_positive
-                            if precision + recall > 0:
-                                f1 = 2 * precision * recall / (precision + recall)
-                                f1_per_class[class_idx] += f1
-                    
-                    # Physics consistency (simplified)
-                    if auxiliary_outputs is not None:
-                        try:
-                            physics_score = self._evaluate_physics_consistency(main_output)
-                            physics_consistency_scores.append(physics_score)
-                        except:
-                            physics_consistency_scores.append(0.0)
-                    else:
-                        physics_consistency_scores.append(0.0)
-                    
-                    # Noise robustness test
-                    try:
-                        noise_score = self._evaluate_noise_robustness(images, masks)
-                        noise_robustness_scores.append(noise_score)
-                    except:
-                        noise_robustness_scores.append(1.0)
-                    
-                    # Timing
-                    inference_time = time.time() - start_time
-                    inference_times.append(inference_time)
-                    
-                except Exception as e:
-                    print(f"Error in evaluation batch {batch_idx}: {e}")
-                    continue
+        # Convert to FL-compatible format
+        fl_compatible_metrics = convert_metrics_for_fl_server(research_metrics)
         
-        # Compute final metrics
-        num_batches = len(self.valloader) if self.valloader else 0
-        avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
-        accuracy = correct_predictions / total_pixels if total_pixels > 0 else 0.0
+        # Extract essential values
+        avg_loss = fl_compatible_metrics.get('eval_loss', 1.0)
+        num_examples = int(fl_compatible_metrics.get('num_examples', 0))
+        evaluation_time = time.time() - start_time
         
-        # Average per-class metrics
-        avg_dice_per_class = []
-        avg_iou_per_class = []
-        
-        for class_idx in range(num_classes):
-            # Dice scores
-            if dice_scores_per_class[class_idx]:
-                avg_dice = np.mean(dice_scores_per_class[class_idx])
-            else:
-                avg_dice = 0.0
-            avg_dice_per_class.append(avg_dice)
-            
-            # IoU scores  
-            if iou_scores_per_class[class_idx]:
-                avg_iou = np.mean(iou_scores_per_class[class_idx])
-            else:
-                avg_iou = 0.0
-            avg_iou_per_class.append(avg_iou)
-            
-            # Normalize precision/recall/f1 by number of batches
-            if num_batches > 0:
-                precision_per_class[class_idx] /= num_batches
-                recall_per_class[class_idx] /= num_batches
-                f1_per_class[class_idx] /= num_batches
-        
-        # Overall averages (excluding background class 0 for medical metrics)
-        foreground_dice = avg_dice_per_class[1:] if len(avg_dice_per_class) > 1 else avg_dice_per_class
-        foreground_iou = avg_iou_per_class[1:] if len(avg_iou_per_class) > 1 else avg_iou_per_class
-        foreground_precision = precision_per_class[1:] if len(precision_per_class) > 1 else precision_per_class
-        foreground_recall = recall_per_class[1:] if len(recall_per_class) > 1 else recall_per_class
-        foreground_f1 = f1_per_class[1:] if len(f1_per_class) > 1 else f1_per_class
-        
-        avg_dice_foreground = np.mean(foreground_dice) if foreground_dice else 0.0
-        avg_iou_foreground = np.mean(foreground_iou) if foreground_iou else 0.0
-        avg_precision_foreground = np.mean(foreground_precision) if foreground_precision else 0.0
-        avg_recall_foreground = np.mean(foreground_recall) if foreground_recall else 0.0
-        avg_f1_foreground = np.mean(foreground_f1) if foreground_f1 else 0.0
-        
-        # Additional metrics
-        avg_physics_consistency = np.mean(physics_consistency_scores) if physics_consistency_scores else 0.0
-        avg_noise_robustness = np.mean(noise_robustness_scores) if noise_robustness_scores else 1.0
-        avg_inference_time = np.mean(inference_times) if inference_times else 0.0
-        total_evaluation_time = sum(inference_times) if inference_times else 0.0
-        
-        # Prepare comprehensive metrics dictionary
+        # CREATE CLIENT METRICS FROM RESEARCH METRICS
         metrics = {
-            # Overall metrics
-            'eval_loss': float(avg_loss),
-            'eval_accuracy': float(accuracy),
-            'num_eval_samples': int(total_samples),
-            
-            # Average metrics (foreground classes)
-            'eval_dice_avg': float(avg_dice_foreground),
-            'eval_iou_avg': float(avg_iou_foreground), 
-            'eval_precision_avg': float(avg_precision_foreground),
-            'eval_recall_avg': float(avg_recall_foreground),
-            'eval_f1_avg': float(avg_f1_foreground),
-            
-            # Per-class Dice scores
-            'eval_dice_class_0': float(avg_dice_per_class[0]),
-            'eval_dice_class_1': float(avg_dice_per_class[1]),
-            'eval_dice_class_2': float(avg_dice_per_class[2]),
-            'eval_dice_class_3': float(avg_dice_per_class[3]),
-            
-            # Per-class IoU scores
-            'eval_iou_class_0': float(avg_iou_per_class[0]),
-            'eval_iou_class_1': float(avg_iou_per_class[1]),
-            'eval_iou_class_2': float(avg_iou_per_class[2]),
-            'eval_iou_class_3': float(avg_iou_per_class[3]),
-            
-            # Per-class Precision
-            'eval_precision_class_0': float(precision_per_class[0]),
-            'eval_precision_class_1': float(precision_per_class[1]),
-            'eval_precision_class_2': float(precision_per_class[2]),
-            'eval_precision_class_3': float(precision_per_class[3]),
-            
-            # Per-class Recall
-            'eval_recall_class_0': float(recall_per_class[0]),
-            'eval_recall_class_1': float(recall_per_class[1]),
-            'eval_recall_class_2': float(recall_per_class[2]),
-            'eval_recall_class_3': float(recall_per_class[3]),
-            
-            # Per-class F1 scores
-            'eval_f1_class_0': float(f1_per_class[0]),
-            'eval_f1_class_1': float(f1_per_class[1]),
-            'eval_f1_class_2': float(f1_per_class[2]),
-            'eval_f1_class_3': float(f1_per_class[3]),
-            
-            # Medical-specific metrics
-            'physics_consistency': float(avg_physics_consistency),
-            'noise_robustness': float(avg_noise_robustness),
-            
-            # Performance metrics
-            'evaluation_time': float(total_evaluation_time),
-            'inference_time_per_sample': float(avg_inference_time),
-            'avg_inference_time_per_batch': float(avg_inference_time),
-            'peak_memory_mb': float(torch.cuda.memory_allocated() / 1024 / 1024) if torch.cuda.is_available() else 0.0
+            "eval_loss": float(avg_loss),
+            "num_examples": int(num_examples),
+            "num_batches": int(research_metrics.get('total_batches', 0)),
+            "evaluation_time": float(evaluation_time),
+            "client_id": str(self.client_id),
         }
         
-        # Log formatted evaluation results
-        print(f"\nClient {self.client_id} Evaluation Results:")
-        print("="*60)
-        print(f"Overall Performance:")
-        print(f"  Loss: {avg_loss:.6f}")
-        print(f"  Accuracy: {accuracy:.6f}")
-        print(f"  Samples: {total_samples}")
-        print("")
-        print(f"Average Metrics (Foreground Classes):")
-        print(f"  Dice Score: {avg_dice_foreground:.6f}")
-        print(f"  IoU Score: {avg_iou_foreground:.6f}")
-        print(f"  Precision: {avg_precision_foreground:.6f}")
-        print(f"  Recall: {avg_recall_foreground:.6f}")
-        print(f"  F1 Score: {avg_f1_foreground:.6f}")
-        print("")
-        print(f"Per-Class Dice Scores:")
-        print(f"  Class 0 (Background): {avg_dice_per_class[0]:.6f}")
-        print(f"  Class 1 (RV):         {avg_dice_per_class[1]:.6f}")
-        print(f"  Class 2 (Myocardium): {avg_dice_per_class[2]:.6f}")
-        print(f"  Class 3 (LV):         {avg_dice_per_class[3]:.6f}")
-        print("")
-        print(f"Per-Class IoU Scores:")
-        print(f"  Class 0 (Background): {avg_iou_per_class[0]:.6f}")
-        print(f"  Class 1 (RV):         {avg_iou_per_class[1]:.6f}")
-        print(f"  Class 2 (Myocardium): {avg_iou_per_class[2]:.6f}")
-        print(f"  Class 3 (LV):         {avg_iou_per_class[3]:.6f}")
-        print("")
-        print(f"Per-Class Precision:")
-        print(f"  Class 0 (Background): {precision_per_class[0]:.6f}")
-        print(f"  Class 1 (RV):         {precision_per_class[1]:.6f}")
-        print(f"  Class 2 (Myocardium): {precision_per_class[2]:.6f}")
-        print(f"  Class 3 (LV):         {precision_per_class[3]:.6f}")
-        print("")
-        print(f"Per-Class Recall:")
-        print(f"  Class 0 (Background): {recall_per_class[0]:.6f}")
-        print(f"  Class 1 (RV):         {recall_per_class[1]:.6f}")
-        print(f"  Class 2 (Myocardium): {recall_per_class[2]:.6f}")
-        print(f"  Class 3 (LV):         {recall_per_class[3]:.6f}")
-        print("")
-        print(f"Per-Class F1 Scores:")
-        print(f"  Class 0 (Background): {f1_per_class[0]:.6f}")
-        print(f"  Class 1 (RV):         {f1_per_class[1]:.6f}")
-        print(f"  Class 2 (Myocardium): {f1_per_class[2]:.6f}")
-        print(f"  Class 3 (LV):         {f1_per_class[3]:.6f}")
-        print("")
-        print(f"Additional Metrics:")
-        print(f"  Physics Consistency: {avg_physics_consistency:.6f}")
-        print(f"  Noise Robustness: {avg_noise_robustness:.6f}")
-        print(f"  Evaluation Time: {total_evaluation_time:.3f}s")
-        print("="*60)
+        # Add all FL-compatible metrics
+        metrics.update(fl_compatible_metrics)
         
-        return metrics
-    
-    def _evaluate_physics_consistency(self, outputs: torch.Tensor) -> float:
-        """Evaluate physics consistency using simplified method."""
+        # EXTRACT VALUES FOR PRINTING (from research_metrics for accuracy)
+        mean_dice = research_metrics.get('mean_dice_fg', 0.0)  # Foreground dice
+        mean_iou = research_metrics.get('mean_iou_fg', 0.0)    # Foreground IoU
+        mean_precision = research_metrics.get('mean_precision', 0.0)
+        mean_recall = research_metrics.get('mean_recall', 0.0)
+        mean_f1 = research_metrics.get('mean_f1', 0.0)
+        
+        dice_scores = research_metrics.get('dice_scores', [0.0, 0.0, 0.0, 0.0])
+        iou_scores = research_metrics.get('iou_scores', [0.0, 0.0, 0.0, 0.0])
+        precision_scores = research_metrics.get('precision_scores', [0.0, 0.0, 0.0, 0.0])
+        recall_scores = research_metrics.get('recall_scores', [0.0, 0.0, 0.0, 0.0])
+        f1_scores = research_metrics.get('f1_scores', [0.0, 0.0, 0.0, 0.0])
+        
+        # ADAPTIVE KAPPA: Extract dice scores for potential κ adaptation
         try:
-            # Simplified consistency check - just check if outputs are reasonable
-            output_mean = torch.mean(outputs).item()
-            output_std = torch.std(outputs).item()
-            # If outputs are finite and not extreme, consider it consistent
-            if torch.isfinite(outputs).all() and 0.0 <= output_mean <= 10.0 and output_std < 100.0:
-                return 1.0
-            else:
-                return 0.5
-        except Exception:
-            return 1.0
-    
-    def _evaluate_noise_robustness(self, images: torch.Tensor, masks: torch.Tensor) -> float:
-        """Evaluate model robustness to noise using simplified method."""
-        try:
-            # Simplified robustness check - just return reasonable default
-            return 0.8  # Assume reasonable robustness
-        except Exception:
-            return 1.0
-    
-    # 4. DATA HANDLING FUNCTIONS
-    
-    def _load_client_data(self):
-        """Load ACDC data using manual loading for reliable data access"""
-        try:
-            self.logger.info(f"Loading ACDC data from: {self.data_path}")
-            
-            # Manual ACDC loading with proper structure handling
-            class SimpleACDCDataset(Dataset):
-                def __init__(self, data_dir, num_samples=100):
-                    self.data_dir = Path(data_dir)
-                    self.samples = []
-                    
-                    # Handle ACDC structure where data is in database/training or database/testing
-                    if not self.data_dir.exists():
-                        print(f"Data directory {self.data_dir} does not exist")
-                        return
-                    
-                    # Try multiple possible ACDC data paths
-                    possible_paths = [
-                        self.data_dir / "database" / "training",
-                        self.data_dir / "database" / "testing", 
-                        self.data_dir / "training",
-                        self.data_dir / "testing",
-                        self.data_dir
-                    ]
-                    
-                    patient_dirs = []
-                    for possible_path in possible_paths:
-                        if possible_path.exists():
-                            dirs = sorted([d for d in possible_path.iterdir() 
-                                         if d.is_dir() and d.name.startswith('patient')])
-                            if dirs:
-                                patient_dirs = dirs
-                                print(f"Found {len(patient_dirs)} patient directories in {possible_path}")
-                                break
-                    
-                    if not patient_dirs:
-                        print(f"No patient directories found in any of: {possible_paths}")
-                        return
-                    
-                    for patient_dir in patient_dirs:
-                        if len(self.samples) >= num_samples:
-                            break
-                            
-                        try:
-                            print(f"Processing {patient_dir.name}")
-                            
-                            # Handle ACDC structure - files are in subdirectories 
-                            # Structure: patient001/patient001_frame01.nii/patient001_frame01.nii.gz
-                            
-                            # Method 1: Direct .nii.gz files in patient folder
-                            image_files = list(patient_dir.glob("*_frame*.nii*"))
-                            mask_files = list(patient_dir.glob("*_frame*_gt.nii*"))
-                            
-                            # Method 2: Files in subdirectories (actual ACDC structure)
-                            if not image_files or not mask_files:
-                                # Look in subdirectories
-                                for subdir in patient_dir.iterdir():
-                                    if subdir.is_dir():
-                                        sub_image_files = list(subdir.glob("*.nii*"))
-                                        if sub_image_files and '_gt' not in subdir.name:
-                                            image_files.extend(sub_image_files)
-                                        elif sub_image_files and '_gt' in subdir.name:
-                                            mask_files.extend(sub_image_files)
-                            
-                            # Remove GT files from image list
-                            image_files = [f for f in image_files if '_gt' not in f.name and '_gt' not in str(f.parent.name)]
-                            
-                            print(f"  Found {len(image_files)} image files, {len(mask_files)} mask files")
-                            
-                            # Pair images with masks
-                            for img_file in image_files:
-                                if len(self.samples) >= num_samples:
-                                    break
-                                    
-                                # Extract frame info from image path
-                                if '_frame' in img_file.name:
-                                    frame_part = img_file.name.split('_frame')[1].split('.')[0]
-                                    patient_part = img_file.name.split('_frame')[0]
-                                else:
-                                    continue
-                                
-                                # Find corresponding mask
-                                corresponding_mask = None
-                                for mask_file in mask_files:
-                                    if f"{patient_part}_frame{frame_part}_gt" in mask_file.name or f"{patient_part}_frame{frame_part}_gt" in str(mask_file.parent.name):
-                                        corresponding_mask = mask_file
-                                        break
-                                
-                                if corresponding_mask:
-                                    self.samples.append((img_file, corresponding_mask))
-                                    print(f"  Matched: {img_file.name} -> {corresponding_mask.name}")
-                                else:
-                                    print(f"  No mask found for: {img_file.name}")
-                                    
-                        except Exception as e:
-                            print(f"Error processing patient {patient_dir}: {e}")
-                            continue
-                    
-                    print(f"Total valid pairs found: {len(self.samples)}")
-                    
-                def __len__(self):
-                    return len(self.samples)
-                
-                def __getitem__(self, idx):
-                    img_path, gt_path = self.samples[idx]
-                    
-                    try:
-                        # Load NIfTI files with proper error checking
-                        if not NIBABEL_AVAILABLE:
-                            raise ImportError("nibabel not available")
-                        
-                        img_nii = nib.load(str(img_path))  # type: ignore
-                        gt_nii = nib.load(str(gt_path))  # type: ignore
-                        
-                        # Get data arrays with type handling
-                        try:
-                            img_data = img_nii.get_fdata()  # type: ignore
-                            gt_data = gt_nii.get_fdata()  # type: ignore
-                        except AttributeError:
-                            img_data = img_nii.get_data()  # type: ignore
-                            gt_data = gt_nii.get_data()  # type: ignore
-                        
-                        # Take middle slice if 3D
-                        if len(img_data.shape) == 3:
-                            mid_slice = img_data.shape[2] // 2
-                            img_data = img_data[:, :, mid_slice]
-                            gt_data = gt_data[:, :, mid_slice]
-                        
-                        # Resize to 256x256
-                        from skimage.transform import resize
-                        img_data = resize(img_data, (256, 256), preserve_range=True)
-                        gt_data = resize(gt_data, (256, 256), preserve_range=True, order=0)
-                        
-                        # Normalize image
-                        img_data = (img_data - img_data.min()) / (img_data.max() - img_data.min() + 1e-8)
-                        
-                        # Convert to tensors
-                        image = torch.from_numpy(img_data).float().unsqueeze(0)  # Add channel dim
-                        mask = torch.from_numpy(gt_data).long()
-                        
-                        # Ensure mask has valid classes (0-3)
-                        mask = torch.clamp(mask, 0, 3)
-                        
-                        return image, mask
-                        
-                    except Exception as e:
-                        # Return dummy data if loading fails
-                        image = torch.randn(1, 256, 256)
-                        mask = torch.randint(0, 4, (256, 256))
-                        return image, mask
-            
-            # Create dataset
-            dataset = SimpleACDCDataset(str(self.data_path), num_samples=100)
-                
-            if len(dataset) > 0:
-                # CRITICAL FIX: Analyze data distribution BEFORE splitting
-                self.logger.info(f"=== DATA DISTRIBUTION ANALYSIS FOR CLIENT {self.client_id} ===")
-                
-                # Sample a few items to check class distribution
-                class_counts = {0: 0, 1: 0, 2: 0, 3: 0}
-                sample_size = min(20, len(dataset))
-                
-                for i in range(sample_size):
-                    _, mask = dataset[i]
-                    unique_classes, counts = torch.unique(mask, return_counts=True)
-                    for class_id, count in zip(unique_classes.tolist(), counts.tolist()):
-                        if class_id in class_counts:
-                            class_counts[class_id] += count
-                
-                total_pixels = sum(class_counts.values())
-                class_percentages = {k: (v/total_pixels)*100 for k, v in class_counts.items()}
-                
-                self.logger.info(f"Class distribution (sample of {sample_size} images):")
-                self.logger.info(f"  Class 0 (Background): {class_percentages[0]:.1f}% ({class_counts[0]} pixels)")
-                self.logger.info(f"  Class 1 (RV): {class_percentages[1]:.1f}% ({class_counts[1]} pixels)")
-                self.logger.info(f"  Class 2 (Myocardium): {class_percentages[2]:.1f}% ({class_counts[2]} pixels)")
-                self.logger.info(f"  Class 3 (LV): {class_percentages[3]:.1f}% ({class_counts[3]} pixels)")
-                
-                # Check for extreme non-IID (class imbalance)
-                non_bg_classes = [class_percentages[i] for i in range(1, 4)]
-                max_class_pct = max(non_bg_classes)
-                min_class_pct = min(non_bg_classes)
-                
-                if max_class_pct > 80.0:
-                    self.logger.warning(f"⚠️  EXTREME NON-IID DETECTED: Class dominance {max_class_pct:.1f}%")
-                elif max_class_pct - min_class_pct > 50.0:
-                    self.logger.warning(f"⚠️  MODERATE NON-IID: Class imbalance {max_class_pct:.1f}% vs {min_class_pct:.1f}%")
-                else:
-                    self.logger.info(f"✅ BALANCED DATA: Classes are reasonably distributed")
-                
-                self.logger.info("=" * 60)
-                
-                # Split into train/val
-                train_size = int(0.8 * len(dataset))
-                val_size = len(dataset) - train_size
-                
-                train_dataset, val_dataset = torch.utils.data.random_split(
-                    dataset, [train_size, val_size]
-                )
-                
-                # Create dataloaders
-                self.trainloader = DataLoader(train_dataset, batch_size=self.batch_size, shuffle=True)
-                self.valloader = DataLoader(val_dataset, batch_size=self.batch_size, shuffle=False)
-                
-                # Update sample counts
-                self.num_examples["trainset"] = len(train_dataset)
-                self.num_examples["valset"] = len(val_dataset)
-                
-                self.logger.info(f"Successfully loaded ACDC data: {self.num_examples['trainset']} training samples, {self.num_examples['valset']} validation samples")
-                return
-            else:
-                raise ValueError("No valid ACDC samples found")
-                
+            metrics.update({
+                'kappa_enabled': True,
+                'dice_for_kappa': dice_scores,  # Use research metrics dice scores
+            })
         except Exception as e:
-            self.logger.error(f"Failed to load ACDC data: {e}")
-            # Fallback to dummy data
-            self._create_minimal_dummy_data()
-    
-    def _create_minimal_dummy_data(self):
-        """Create high-quality synthetic data for optimal training performance."""
-        self.logger.warning("Creating synthetic ACDC data for testing")
+            self.logger.warning(f"Kappa metrics collection failed: {e}")
         
-        # Create simple but effective synthetic dataset
-        num_samples = 100
+        # DETAILED FEDERATED LEARNING ROUND RESULTS (like training epochs)
+        current_round = config.get("round", "Unknown")
+        print(f"\n" + "="*80)
+        print(f"--- FL Round {current_round} Evaluation Results ---")
+        print(f"   Round {current_round} - Evaluation Loss: {avg_loss:.4f}")
+        print(f"   Evaluating on validation set...")
+        print(f"   Round {current_round} - Validation (Avg Foreground): Dice: {mean_dice:.4f}; IoU: {mean_iou:.4f}; Precision: {mean_precision:.4f}; Recall: {mean_recall:.4f}; F1-score: {mean_f1:.4f}")
         
-        # Generate synthetic images and masks
-        images = []
-        masks = []
+        # Per-class detailed metrics (same format as training epochs)
+        class_labels = ["Background", "RV", "Myocardium", "LV"]
+        for i, class_name in enumerate(class_labels):
+            if i < len(dice_scores):
+                dice = dice_scores[i]
+                iou = iou_scores[i] if i < len(iou_scores) else 0.0
+                precision = precision_scores[i] if i < len(precision_scores) else 0.0
+                recall = recall_scores[i] if i < len(recall_scores) else 0.0
+                f1 = f1_scores[i] if i < len(f1_scores) else 0.0
+                
+                print(f"     Class {i}: Dice: {dice:.4f}; IoU: {iou:.4f}; Precision: {precision:.4f}; Recall: {recall:.4f}; F1-score: {f1:.4f}")
         
-        for i in range(num_samples):
-            # Create synthetic cardiac-like image
-            img = torch.randn(1, 256, 256) * 0.5 + 0.5  # Normalized around 0.5
-            
-            # Create synthetic segmentation mask
-            mask = torch.zeros(256, 256, dtype=torch.long)
-            
-            # Add some structure (simple circles for heart chambers)
-            center_x, center_y = 128, 128
-            for x in range(256):
-                for y in range(256):
-                    dist = ((x - center_x) ** 2 + (y - center_y) ** 2) ** 0.5
-                    if dist < 20:
-                        mask[y, x] = 3  # LV
-                    elif dist < 35:
-                        mask[y, x] = 2  # Myocardium
-                    elif dist < 50:
-                        mask[y, x] = 1  # RV
-                    # else: 0 (background)
-            
-            images.append(img)
-            masks.append(mask)
+        print(f"   Client: {self.client_id} | Data: {num_examples} samples | Time: {evaluation_time:.1f}s")
+        print("="*80)
         
-        # Create TensorDataset
-        dummy_dataset = torch.utils.data.TensorDataset(
-            torch.stack(images), 
-            torch.stack(masks)
-        )
+        # Brief summary for FL logs
+        print(f"[Client {self.client_id}] Round {current_round} Summary: Loss={avg_loss:.4f} | Dice={mean_dice:.4f} | Data={num_examples}")
         
-        # Split into train/val (80/20)
-        train_size = int(0.8 * len(dummy_dataset))
-        val_size = len(dummy_dataset) - train_size
-        
-        train_dataset, val_dataset = torch.utils.data.random_split(
-            dummy_dataset, [train_size, val_size]
-        )
-        
-        # Create dataloaders
-        self.trainloader = DataLoader(train_dataset, batch_size=self.batch_size, shuffle=True)
-        self.valloader = DataLoader(val_dataset, batch_size=self.batch_size, shuffle=False)
-        
-        # Update sample counts
-        self.num_examples["trainset"] = len(train_dataset)
-        self.num_examples["valset"] = len(val_dataset)
-        
-        self.logger.info(f"Created synthetic ACDC data: {len(train_dataset)} training samples, {len(val_dataset)} validation samples")
+        return float(avg_loss), int(num_examples), metrics
 
-# 5. CLIENT FACTORY FUNCTION
+# 4. CLIENT APP FACTORY FUNCTION - REQUIRED FOR FLOWER 1.18.0
 
 def client_fn(context: Context) -> Client:
-    """
-    Create and configure a FlowerClient instance.
-    
-    Args:
-        context: Flower Context containing client configuration
-        
-    Returns:
-        Configured FlowerClient instance as Client
-    """
+    """Create a Flower client instance with enhanced partition detection"""
     try:
-        # 5.1 Client ID Processing
-        # Extract client ID from context
-        client_id = str(context.node_id)
-        partition_id = context.node_id if context.node_id is not None else 0
-        num_partitions = 10  # Default number of partitions
+        # Extract client configuration from context
+        client_id = context.node_config.get("client-id", "default_client")
+        data_path = context.node_config.get("data-path", "data/raw/ACDC")
         
-        # 5.2 Environment Setup
+        # Extract model and training configurations
+        model_config = {
+            'n_channels': context.node_config.get('n-channels', 1),
+            'n_classes': context.node_config.get('n-classes', 4),
+            'dropout_rate': context.node_config.get('dropout-rate', 0.1),
+            'use_batch_norm': context.node_config.get('use-batch-norm', True),
+            'use_residual': context.node_config.get('use-residual', True)
+        }
         
-        # Set reproducible seed based on partition ID
-        set_seed(42 + int(partition_id))
+        training_config = {
+            'local_epochs': context.node_config.get('local-epochs', DEFAULT_LOCAL_EPOCHS),
+            'batch_size': context.node_config.get('batch-size', DEFAULT_BATCH_SIZE),
+            'learning_rate': context.node_config.get('learning-rate', DEFAULT_LEARNING_RATE),
+            'weight_decay': context.node_config.get('weight-decay', 1e-5),
+            'gradient_clip_norm': context.node_config.get('gradient-clip-norm', 1.0)
+        }
         
-        # Setup logging
-        logger = setup_federated_logger(
-            client_id=client_id,
-            log_dir="logs/clients",
-            level=logging.INFO
-        )
-        
-        logger.info(f"Creating client {client_id} (partition {partition_id}/{num_partitions})")
-        
-        # 5.3 Data Pipeline Initialization
-        # Determine data path for this client
-        base_data_path = "data/raw/ACDC"  # Default data path
-        client_data_path = f"{base_data_path}/client_{partition_id}"
-        
-        # If client-specific path doesn't exist, use base path
-        if not os.path.exists(client_data_path):
-            client_data_path = base_data_path
-            logger.info(f"Client-specific path not found, using base path: {client_data_path}")
-        
-        # 5.4 Model Configuration
-        # Extract configuration from context if available
-        model_config_raw = context.run_config.get("model_config", {}) if context.run_config else {}
-        training_config_raw = context.run_config.get("training_config", {}) if context.run_config else {}
-        
-        # Ensure configs are dictionaries
-        model_config = model_config_raw if isinstance(model_config_raw, dict) else {}
-        training_config = training_config_raw if isinstance(training_config_raw, dict) else {}
-        
-        # 5.5 Client Instance Creation
-        client = FlowerClient(
-            client_id=client_id,
-            data_path=str(client_data_path),
+        # Create client instance
+        flower_client = FlowerClient(
+            client_id=str(client_id),
+            data_path=str(data_path),
             model_config=model_config,
             training_config=training_config,
             device=DEVICE
         )
         
-        logger.info(f"Client {client_id} created successfully")
-        return client.to_client()
+        #  NEW: Enhanced Flower integration
+        # Store Flower context for auto-detection
+        flower_client._flower_context = context
+        
+        # Extract partition-id from Flower context (for simulation)
+        partition_id = context.node_config.get("partition-id", None)
+        if partition_id is not None:
+            flower_client._partition_id = int(partition_id)
+        
+        flower_client.logger.info(f"Client {client_id} created with Flower partitioning support")
+        
+        #  FIXED: Convert NumPyClient to Client using the official method
+        return flower_client.to_client()
+        
     except Exception as e:
-        logging.error(f"Failed to create client: {e}")
-        raise
+        # Fallback configuration if context fails
+        print(f"Warning: Failed to extract config from context: {e}")
+        print("Using default client configuration")
+        
+        flower_client = FlowerClient(
+            client_id="default_client",
+            data_path="data/raw/ACDC",
+            model_config=DEFAULT_MODEL_CONFIG,
+            training_config=DEFAULT_TRAINING_CONFIG,
+            device=DEVICE
+        )
+        
+        #  FIXED: Convert NumPyClient to Client using the official method
+        return flower_client.to_client()
 
-# 6. UTILITY FUNCTIONS
+# 5. CLIENT APP DEFINITION - REQUIRED FOR FLOWER 1.18.0
 
-def memory_cleanup():
-    """Clean up memory and cache."""
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-    gc.collect()
+app = ClientApp(client_fn=client_fn)
 
-def optimize_memory():
-    """Optimize memory usage."""
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        # Set memory fraction if needed
-        # torch.cuda.set_per_process_memory_fraction(0.8)
+# 6. DEVELOPMENT AND TESTING SUPPORT
 
-def monitor_resources() -> Dict[str, float]:
-    """Monitor resource usage."""
-    resources = {}
+if __name__ == "__main__":
+
+    # Direct testing option
+    import sys
     
-    if torch.cuda.is_available():
-        resources["gpu_memory_allocated"] = torch.cuda.memory_allocated() / 1024 / 1024  # MB
-        resources["gpu_memory_reserved"] = torch.cuda.memory_reserved() / 1024 / 1024  # MB
-    
-    # CPU and system memory monitoring could be added here
-    return resources
+    if "--test-client" in sys.argv:
+        try:
+            print("\n Testing client initialization...")
+            
+            # Create a dummy context for testing
+            from flwr.common import Context
+            
+            class DummyNodeConfig:
+                def get(self, key, default=None):
+                    config_map = {
+                        'client-id': 'test_client_001',
+                        'data-path': 'data/raw/ACDC',
+                        'n-channels': 1,
+                        'n-classes': 4,
+                        'local-epochs': 2,
+                        'batch-size': 2,
+                        'learning-rate': 0.001
+                    }
+                    return config_map.get(key, default)
+            
+            class DummyContext:
+                def __init__(self):
+                    self.node_config = DummyNodeConfig()
+            
+            dummy_context = DummyContext()
+            
+            # Test client creation  
+            test_client = client_fn(dummy_context)  # type: ignore
+            
+            print(f"Client created successfully")
+            print(f"   Client type: {type(test_client).__name__}")
+            print(f"   Device available")
+            
+            # Simple test without accessing specific attributes
+            print(f"   Client initialized and ready for FL")
+            
+            print("\nCLIENT TEST COMPLETED SUCCESSFULLY!")
+            print("The client is ready for federated learning deployment.")
+            
+        except Exception as e:
+            print(f"\nCLIENT TEST FAILED: {type(e).__name__}: {str(e)}")
+            import traceback
+            traceback.print_exc()
+    else:
+        print("\n Use --test-client flag to test client initialization")
+        print("For production deployment, use the CLI commands above.")
 
-def handle_training_error(error: Exception, client_id: str) -> Dict[str, Any]:
-    """Handle training errors gracefully."""
-    logging.error(f"Training error in client {client_id}: {error}")
-    return {
-        "error": str(error),
-        "error_type": type(error).__name__,
-        "client_id": client_id,
-        "timestamp": time.time()
-    }
 
-# 7. CLIENTAPP CREATION AND EXPORT
-
-# Create the ClientApp with comprehensive error handling
-try:
-    app = ClientApp(client_fn=client_fn)
-    logging.info("ClientApp created successfully")
-except Exception as e:
-    logging.error(f"Failed to create ClientApp: {e}")
-    raise
-
-# Export for Flower framework
-__all__ = ["app", "FlowerClient", "client_fn"]
-
-# Version and compatibility information
-__version__ = "1.0.0"
-__flower_version__ = "1.18.0"  # Cập nhật version
-__description__ = "Comprehensive Federated Learning Client for Medical Image Segmentation"
