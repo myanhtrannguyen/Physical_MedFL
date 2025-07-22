@@ -288,7 +288,7 @@ class UnifiedFairnessStrategy(FedAvg):
     def __init__(
         self,
         *,
-        eta: float = 1e-2,
+        eta: float = 1e-4,
         eta_adapt_rate: float = 1.0,
         beta_1: float = 0.9,
         beta_2: float = 0.99,

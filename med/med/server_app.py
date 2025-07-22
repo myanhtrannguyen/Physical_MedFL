@@ -144,7 +144,7 @@ def server_fn(context: Context):
         evaluate_fn=get_evaluate_fn(),
         
         # UnifiedFairnessStrategy specific parameters
-        eta=0.01,
+        eta=0.0001,
         eta_adapt_rate=1.5,
         w_impact=0.4,
         w_debt=0.6,

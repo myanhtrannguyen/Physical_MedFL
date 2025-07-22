@@ -40,11 +40,11 @@ serverapp = "med.server_app:app"
 clientapp = "med.client_app:app"
 
 [tool.flwr.app.config]
-num-server-rounds = 2
+num-server-rounds = 10
 fraction-fit = 0.8
-local-epochs = 1
+local-epochs = 50
 experiment-name = "ACDC_Medical_FL_CPU"
-min-fit-clients = 3
+min-fit-clients = 4
 min-available-clients = 5
 
 [tool.flwr.federations]
