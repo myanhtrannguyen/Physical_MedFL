@@ -1,0 +1,20 @@
+{
+  "experiment_name": "UnifiedFairness_Experiment",
+  "strategy_name": "UnifiedFairnessStrategy",
+  "total_rounds": 1,
+  "experiment_duration_minutes": 82.33850550000001,
+  "final_loss": 0.9906635856242761,
+  "best_loss": 0.9906635856242761,
+  "initial_loss": 0.9906635856242761,
+  "total_loss_improvement": 0.0,
+  "final_accuracy": 0.0,
+  "best_accuracy": 0.0,
+  "initial_accuracy": 0.0,
+  "total_accuracy_improvement": 0.0,
+  "convergence_achieved": false,
+  "stability_score": 0.0,
+  "improvement_rate": 0.0,
+  "final_fg_dice": 0.009345815525760609,
+  "best_fg_dice": 0.009345815525760609,
+  "fg_dice_improvement": 0.0
+}
