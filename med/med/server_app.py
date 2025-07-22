@@ -44,22 +44,49 @@ class MedicalFLStrategy(UnifiedFairnessStrategy):
         return aggregated_result
     
     def _post_process_results(self):
-        """Handle post-processing after training completes."""
+        """Handle post-processing after training completes with enhanced analysis."""
         try:
-            print(f"\n=== Training completed after {self.rounds_completed} rounds ===")
+            print(f"Training completed after {self.rounds_completed} rounds")
+            print("Exporting comprehensive research data...")
+            
+            # Export enhanced experiment data
+            exported_files = self.experiment_tracker.export_research_data()
+            print(f"Data exported: {list(exported_files.keys())}")
+            
+            # Get performance summary
+            performance_summary = self.experiment_tracker.get_performance_summary()
+            if performance_summary:
+                print("EXPERIMENT SUMMARY:")
+                print(f"  Final Accuracy: {performance_summary.get('final_accuracy', 0.0):.4f}")
+                print(f"  Accuracy Improvement: {performance_summary.get('total_accuracy_improvement', 0.0):.4f}")
+                print(f"  Convergence: {performance_summary.get('convergence_achieved', False)}")
+                print(f"  Duration: {performance_summary.get('experiment_duration_minutes', 0.0):.1f} minutes")
+                
+                if 'final_fg_dice' in performance_summary:
+                    print(f"  Final Dice: {performance_summary['final_fg_dice']:.4f}")
+                    print(f"  Dice Improvement: {performance_summary.get('fg_dice_improvement', 0.0):.4f}")
+            
+            # Legacy post-processing
             export_and_plot_results(self, self.experiment_name)
             
-            # Create experiment summary
+            # Create enhanced experiment summary
             config = {
                 "rounds_completed": self.rounds_completed,
                 "strategy": "UnifiedFairnessStrategy", 
-                "experiment_name": self.experiment_name
+                "experiment_name": self.experiment_name,
+                "enhanced_tracking": True,
+                "files_exported": list(exported_files.keys()),
+                **performance_summary  # Include performance summary in config
             }
             output_dir = os.path.join("research_exports", self.experiment_name)
             create_experiment_summary(output_dir, self.experiment_name, config)
             
+            print("Post-processing completed")
+            
         except Exception as e:
             print(f"Error in post-processing: {e}")
+            import traceback
+            traceback.print_exc()
 
 
 def get_evaluate_fn():

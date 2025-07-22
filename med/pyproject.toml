@@ -40,15 +40,15 @@ serverapp = "med.server_app:app"
 clientapp = "med.client_app:app"
 
 [tool.flwr.app.config]
-num-server-rounds = 10
+num-server-rounds = 2
 fraction-fit = 0.8
-local-epochs = 50
-experiment-name = "ACDC_Medical_FL"
-min-fit-clients = 40
-min-available-clients = 50
+local-epochs = 1
+experiment-name = "ACDC_Medical_FL_CPU"
+min-fit-clients = 3
+min-available-clients = 5
 
 [tool.flwr.federations]
 default = "local-simulation"
 
 [tool.flwr.federations.local-simulation]
-options.num-supernodes = 50
+options.num-supernodes = 5

@@ -22,11 +22,15 @@ from pathlib import Path
 from torch.utils.data import DataLoader
 from typing import Dict, List, Tuple, Optional, Any, Union
 
+import flwr as fl
+from flwr.common import NDArrays, Scalar
+from flwr.client import NumPyClient
+
 # Add src to path for imports
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'src')))
 
 from .task import get_model, get_weights, load_data, set_weights, test, train
-from utils.losses import Adaptive_tvmf_dice_loss
+from utils.losses import Adaptive_tvmf_dice_loss, DynamicWeightedLoss
 from utils.metrics import evaluate_metrics
 
 # Setup logging
@@ -325,14 +329,43 @@ class FlowerClient(NumPyClient):
         start_time = time.time()
         initial_params = self.get_parameters({})
 
+        # Initialize loss components
+        criterion = None
+        base_criterion = None
+        dynamic_weighter = None
+
         # Setup adaptive loss with kappa values from server
         if kappa_values:
             criterion = Adaptive_tvmf_dice_loss(
                 num_classes=NUM_CLASSES,
                 kappa_values=kappa_values
             ).to(DEVICE)
+            use_advanced_loss = True
         else:
-            criterion = nn.CrossEntropyLoss().to(DEVICE)
+            # Use DynamicWeightedLoss for consistent fallback strategy
+            base_criterion = nn.CrossEntropyLoss(reduction='none')
+            dynamic_weighter = DynamicWeightedLoss(
+                num_classes=NUM_CLASSES,
+                initial_weights=[0.1, 1.0, 1.0, 1.0]  # Medical segmentation weights
+            ).to(DEVICE)
+            use_advanced_loss = False
+
+        def calculate_loss(outputs, labels):
+            """Calculate loss based on available loss type."""
+            if use_advanced_loss and criterion is not None:
+                return criterion(outputs, labels)
+            else:
+                # Dynamic weighted loss calculation
+                assert base_criterion is not None and dynamic_weighter is not None
+                base_losses = base_criterion(outputs, labels)
+                class_losses = []
+                for c in range(NUM_CLASSES):
+                    class_mask = (labels == c)
+                    if class_mask.sum() > 0:
+                        class_losses.append(base_losses[class_mask].mean())
+                    else:
+                        class_losses.append(torch.tensor(0.0, device=DEVICE))
+                return dynamic_weighter(class_losses)
 
         optimizer = torch.optim.Adam(
             self.net.parameters(),
@@ -359,7 +392,7 @@ class FlowerClient(NumPyClient):
             for images, labels in self.trainloader:
                 images, labels = images.to(DEVICE), labels.to(DEVICE)
                 outputs = self.net(images)
-                loss = criterion(outputs, labels)
+                loss = calculate_loss(outputs, labels)
                 total_loss_before += loss.item()
                 num_batches_eval += 1
 
@@ -380,7 +413,7 @@ class FlowerClient(NumPyClient):
 
                 optimizer.zero_grad()
                 outputs = self.net(images)
-                loss = criterion(outputs, labels)
+                loss = calculate_loss(outputs, labels)
                 loss.backward()
                 optimizer.step()
 
@@ -405,7 +438,7 @@ class FlowerClient(NumPyClient):
             for images, labels in self.trainloader:
                 images, labels = images.to(DEVICE), labels.to(DEVICE)
                 outputs = self.net(images)
-                loss = criterion(outputs, labels)
+                loss = calculate_loss(outputs, labels)
                 total_loss_after += loss.item()
                 num_batches_eval += 1
 
@@ -552,17 +585,46 @@ class FlowerClient(NumPyClient):
         # Safely get dataset size
         num_examples = getattr(self.valloader.dataset, '__len__', lambda: len(self.valloader) * 8)()
 
+        # Enhanced metrics for server aggregation
         metrics: Dict[str, Scalar] = {
+            # Basic metrics
             "accuracy": validation_metrics["avg_foreground_dice"],
             "avg_foreground_dice": validation_metrics["avg_foreground_dice"],
             "avg_foreground_iou": validation_metrics["avg_foreground_iou"],
-            "dice_variance": validation_metrics["dice_variance"]
+            "avg_foreground_precision": validation_metrics["avg_foreground_precision"],
+            "avg_foreground_recall": validation_metrics["avg_foreground_recall"],
+            "avg_foreground_f1": validation_metrics["avg_foreground_f1"],
+            
+            # Statistical metrics
+            "dice_variance": validation_metrics["dice_variance"],
+            "dice_std": validation_metrics["dice_std"],
+            "min_dice": validation_metrics["min_dice"],
+            "max_dice": validation_metrics["max_dice"],
+            
+            # Performance diversity
+            "client_id_numeric": hash(self.experiment_config.client_id) % 1000,  # For tracking
+            "validation_samples": num_examples
         }
         
         # Add per-class Dice scores for Adaptive Loss kappa updates
         dice_scores = validation_metrics["dice_scores"]
         for i in range(len(dice_scores)):
             metrics[f"dice_class_{i}"] = float(dice_scores[i])
+        
+        # Add per-class IoU scores for detailed analysis
+        iou_scores = validation_metrics["iou_scores"]
+        for i in range(len(iou_scores)):
+            metrics[f"iou_class_{i}"] = float(iou_scores[i])
+        
+        # Add per-class precision/recall for completeness
+        precision_scores = validation_metrics["precision_scores"]
+        recall_scores = validation_metrics["recall_scores"]
+        f1_scores = validation_metrics["f1_scores"]
+        
+        for i in range(len(precision_scores)):
+            metrics[f"precision_class_{i}"] = float(precision_scores[i])
+            metrics[f"recall_class_{i}"] = float(recall_scores[i])
+            metrics[f"f1_class_{i}"] = float(f1_scores[i])
 
         return loss, num_examples, metrics
 
@@ -615,7 +677,7 @@ def client_fn(context: Context):
     num_partitions = int(context.node_config["num-partitions"])
     
     # Load data for this client
-    trainloader, valloader = load_data(partition_id, num_partitions)
+    trainloader, valloader, testloader = load_data(partition_id, num_partitions)
     
     # Get training config
     local_epochs = int(context.run_config["local-epochs"])

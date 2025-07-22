@@ -1,0 +1,9 @@
+{
+  "experiment_name": "ACDC_Medical_FL_CPU",
+  "configuration": {
+    "rounds_completed": 2,
+    "strategy": "UnifiedFairnessStrategy",
+    "experiment_name": "ACDC_Medical_FL_CPU"
+  },
+  "output_directory": "research_exports/ACDC_Medical_FL_CPU"
+}
