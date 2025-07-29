@@ -19,23 +19,23 @@ class Adaptive_tvmf_dice_loss(nn.Module):
             self.register_buffer('kappa_values', torch.tensor(kappa_values, dtype=torch.float32))
         else:
             self.register_buffer('kappa_values', torch.ones(num_classes) * lambda_val)
-
+            
     def update_kappa_values(self, new_kappa_values) -> None:
         if isinstance(new_kappa_values, (list, np.ndarray)):
             new_kappa_values = torch.tensor(new_kappa_values, dtype=torch.float32)
         device = self.kappa_values.device
         self.kappa_values.data = new_kappa_values.to(device)
-
+        
     def t_vmf_similarity(self, cos_theta, kappa):
         kappa = F.relu(kappa) + self.epsilon
         return torch.exp(kappa * (cos_theta - 1))
-    
+        
     def compute_dice_coefficient(self, pred, target):
         intersection = torch.sum(pred * target)
         union = torch.sum(pred) + torch.sum(target)
         dice = (2.0 * intersection + self.epsilon) / (union + self.epsilon)
         return dice
-    
+        
     def forward(self, inputs, targets):
         if inputs.dim() == 4:
             inputs = F.softmax(inputs, dim=1)
@@ -69,12 +69,12 @@ class Adaptive_tvmf_dice_loss(nn.Module):
         avg_loss = total_loss / self.num_classes
         self.last_class_losses = torch.stack(class_losses)
         return avg_loss
-    
+        
     def get_class_losses(self) -> Any:
         if hasattr(self, 'last_class_losses'):
             return self.last_class_losses.detach().cpu().numpy()
         return np.zeros(self.num_classes)
-    
+        
     def get_adaptive_info(self) -> Any:
         kappa_tensor = getattr(self, 'kappa_values')
         return {'kappa_values': kappa_tensor.detach().cpu().numpy().tolist(), 'lambda_val': self.lambda_val, 'num_classes': self.num_classes}
@@ -88,10 +88,10 @@ class PhysicsLoss(nn.Module):
         b, e, s = b1.to(DEVICE), eps.to(DEVICE), sig.to(DEVICE)
         return torch.mean(self.ms.compute_helmholtz_residual(b, e, s))
 
+
 class SmoothnessLoss(nn.Module):
     def __init__(self):
         super().__init__()
-
     def forward(self, x):
         dy = torch.abs(x[:, :, 1:, :] - x[:, :, :-1, :])
         dx = torch.abs(x[:, :, :, 1:] - x[:, :, :, :-1])
@@ -133,7 +133,8 @@ class DynamicLossWeighter(nn.Module):
 
 class ClassWeightUpdater(nn.Module):
     """
-    Dynamically adjusts class weights for CrossEntropyLoss based on class-wise Dice scores.
+    Dynamically adjusts class weights for CrossEntropyLoss based on a combined
+    metric of class-wise Dice and IoU scores.
     Uses an Exponential Moving Average (EMA) to stabilize weight updates.
     """
     def __init__(self, num_classes: int, alpha: float = 0.9, epsilon: float = 1e-6):
@@ -147,29 +148,45 @@ class ClassWeightUpdater(nn.Module):
         self.num_classes = num_classes
         self.alpha = alpha
         self.epsilon = epsilon
-        # Register EMA of Dice scores as a buffer to move it with the module (e.g., .to(device))
-        self.register_buffer('ema_dice_scores', torch.ones(num_classes))
+        # Buffer giờ sẽ lưu trữ điểm kết hợp (combined score) thay vì chỉ Dice
+        self.register_buffer('ema_combined_scores', torch.ones(num_classes))
 
-    def _calculate_per_class_dice(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        """Calculates Dice score for each class."""
+    def _calculate_per_class_metrics(self, logits: torch.Tensor, targets: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Calculates both Dice and IoU scores for each class.
+        
+        Returns:
+            A tuple containing (dice_scores, iou_scores) as tensors.
+        """
         probs = F.softmax(logits, dim=1)
         targets_one_hot = F.one_hot(targets.long(), num_classes=self.num_classes).permute(0, 3, 1, 2).float()
         
         dice_scores = []
+        iou_scores = []
+        
         for i in range(self.num_classes):
             pred_class = probs[:, i, :, :]
             target_class = targets_one_hot[:, i, :, :]
             
+            # Tính toán các thành phần cơ bản
             intersection = torch.sum(pred_class * target_class)
-            union = torch.sum(pred_class) + torch.sum(target_class)
-            dice = (2. * intersection + self.epsilon) / (union + self.epsilon)
+            pred_sum = torch.sum(pred_class)
+            target_sum = torch.sum(target_class)
+            
+            # Tính Dice Score
+            dice = (2. * intersection + self.epsilon) / (pred_sum + target_sum + self.epsilon)
             dice_scores.append(dice)
             
-        return torch.stack(dice_scores)
+            # Tính IoU Score (Jaccard Index)
+            union = pred_sum + target_sum - intersection
+            iou = (intersection + self.epsilon) / (union + self.epsilon)
+            iou_scores.append(iou)
+            
+        return torch.stack(dice_scores), torch.stack(iou_scores)
 
     def update_and_get_weights(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
         """
-        Updates EMA and returns new class weights based on inverse Dice performance.
+        Updates EMA and returns new class weights based on combined Dice and IoU performance.
         Args:
             logits (torch.Tensor): Raw output from the model (detached).
             targets (torch.Tensor): Ground truth labels.
@@ -177,16 +194,19 @@ class ClassWeightUpdater(nn.Module):
             torch.Tensor: New weights for CrossEntropyLoss.
         """
         with torch.no_grad():
-            current_dice = self._calculate_per_class_dice(logits, targets)
+            # 1. Tính toán cả hai chỉ số
+            current_dice, current_iou = self._calculate_per_class_metrics(logits, targets)
             
-            # Update EMA of Dice scores
-            self.ema_dice_scores = self.alpha * self.ema_dice_scores + (1 - self.alpha) * current_dice
+            # 2. Kết hợp điểm hiệu suất: lấy trung bình cộng
+            current_combined_score = (current_dice + 2 * current_iou) / 3.0
             
-            # Calculate weights as the inverse of the smoothed Dice scores
-            inverse_scores = 1.0 / (self.ema_dice_scores + self.epsilon)
+            # 3. Cập nhật EMA bằng điểm kết hợp
+            self.ema_combined_scores = self.alpha * self.ema_combined_scores + (1 - self.alpha) * current_combined_score
             
-            # Normalize weights to keep the overall loss magnitude stable
-            # Here, we normalize them to sum to num_classes, similar to a default weight of 1 for each class
+            # 4. Tính trọng số dựa trên nghịch đảo của điểm kết hợp đã được làm mượt
+            inverse_scores = 1.0 / (self.ema_combined_scores + self.epsilon)
+            
+            # 5. Chuẩn hóa trọng số
             normalized_weights = self.num_classes * inverse_scores / torch.sum(inverse_scores)
             
             return normalized_weights
@@ -241,7 +261,7 @@ class CombinedLoss(nn.Module):
         lphy = torch.tensor(0.0, device=logits.device)
         if self.pl is not None and b1 is not None and all_es:
             try:
-                e1, s1 = all_es[0]    #, all_es[1] -> all_es[0] is tuple (eps, sig)
+                e1, s1 = all_es[0]   #, all_es[1]
                 lphy = self.pl(b1, e1, s1)
             except (IndexError, TypeError):
                  print("Warning: Physics loss skipped due to unexpected `all_es` format.")
