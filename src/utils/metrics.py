@@ -25,6 +25,7 @@ def evaluate_metrics(model, dataloader, device, num_classes=4):
             - recall: List of recall scores for each class
             - f1_score: List of F1 scores for each class
     """
+
     model.eval()
     tp = [0] * num_classes
     fp = [0] * num_classes
@@ -34,35 +35,23 @@ def evaluate_metrics(model, dataloader, device, num_classes=4):
     batches = 0
 
     with torch.no_grad():
-        for imgs, tgts in dataloader:
-            imgs, tgts = imgs.to(device), tgts.to(device)
-            if imgs.size(0) == 0:
-                continue
-            logits = model(imgs)
-            preds = torch.argmax(F.softmax(logits, dim=1), dim=1)
-            batches += 1
-
+        for imgs,tgts in dataloader:
+            imgs,tgts = imgs.to(device),tgts.to(device)
+            if imgs.size(0) == 0: continue
+            logits,_ = model(imgs)
+            preds = torch.argmax(F.softmax(logits,dim=1),dim=1); batches+=1
             for c in range(num_classes):
-                pc_f, tc_f = (preds == c).float().view(-1), (tgts == c).float().view(-1)
-                inter = (pc_f * tc_f).sum()
-                dice_s[c] += ((2. * inter + 1e-6) / (pc_f.sum() + tc_f.sum() + 1e-6)).item()
-                iou_s[c] += ((inter + 1e-6) / (pc_f.sum() + tc_f.sum() - inter + 1e-6)).item()
-                tp[c] += inter.item()
-                fp[c] += (pc_f.sum() - inter).item()
-                fn[c] += (tc_f.sum() - inter).item()
-
-    metrics = {'dice_scores': [], 'iou': [], 'precision': [], 'recall': [], 'f1_score': []}
-    if batches > 0:
+                pc_f,tc_f=(preds==c).float().view(-1),(tgts==c).float().view(-1); inter=(pc_f*tc_f).sum()
+                dice_s[c]+=((2.*inter+1e-6)/(pc_f.sum()+tc_f.sum()+1e-6)).item()
+                iou_s[c]+=((inter+1e-6)/(pc_f.sum()+tc_f.sum()-inter+1e-6)).item()
+                tp[c]+=inter.item(); fp[c]+=(pc_f.sum()-inter).item(); fn[c]+=(tc_f.sum()-inter).item()
+    metrics={'dice_scores':[],'iou':[],'precision':[],'recall':[],'f1_score':[]}
+    if batches>0:
         for c in range(num_classes):
-            metrics['dice_scores'].append(dice_s[c] / batches)
-            metrics['iou'].append(iou_s[c] / batches)
-            prec, rec = tp[c] / (tp[c] + fp[c] + 1e-6), tp[c] / (tp[c] + fn[c] + 1e-6)
-            metrics['precision'].append(prec)
-            metrics['recall'].append(rec)
-            metrics['f1_score'].append(2 * prec * rec / (prec + rec + 1e-6)
-                                       if (prec + rec > 0) else 0.0)
-    else:
-        for _ in range(num_classes):
-            [metrics[key].append(0.0) for key in metrics]
-
+            metrics['dice_scores'].append(dice_s[c]/batches); metrics['iou'].append(iou_s[c]/batches)
+            prec,rec = tp[c]/(tp[c]+fp[c]+1e-6), tp[c]/(tp[c]+fn[c]+1e-6)
+            metrics['precision'].append(prec); metrics['recall'].append(rec)
+            metrics['f1_score'].append(2*prec*rec/(prec+rec+1e-6) if (prec+rec > 0) else 0.0)
+    else: 
+        for _ in range(num_classes): [metrics[key].append(0.0) for key in metrics]
     return metrics

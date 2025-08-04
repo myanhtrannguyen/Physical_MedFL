@@ -5,5 +5,5 @@ Model components for medical image segmentation in federated learning.
 from .unet import UNet
 
 __all__ = [
-    "UNet"
+    "UNet", "RobustMedVFL_UNet"
 ]
