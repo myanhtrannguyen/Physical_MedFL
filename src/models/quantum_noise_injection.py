@@ -1,3 +1,5 @@
+import torch
+import torch.nn as nn
 def quantum_noise_injection(features, T=1.25, pauli_prob={'X': 0.00096, 'Y': 0.00096, 'Z': 0.00096, 'None': 0.99712}):
     """
     Áp dụng nhiễu lượng tử dựa trên cơ chế Pauli Noise Injection cho dữ liệu ảnh MRI.

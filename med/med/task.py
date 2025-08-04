@@ -16,13 +16,13 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '.
 from models.unet import UNet
 from data_handling.data_loader import get_federated_dataloaders
 from utils.metrics import evaluate_metrics
-from utils.losses import Adaptive_tvmf_dice_loss, DynamicWeightedLoss
+from utils.losses import Adaptive_tvmf_dice_loss, DynamicLossWeighter
 
 # Global variables
 N_CLASSES = 4
 IMG_SIZE = 256
 ALPHA = 0.5
-NUM_WORKERS = 2
+NUM_WORKERS = 4
 DATA_PATH = "../data/ACDC_preprocessed"
 PARTITION_STRATEGY = "non-iid" 
 TRAINING_SOURCES = ["slices"]
@@ -82,13 +82,13 @@ def train(net, trainloader, epochs, device, kappa_values=None):
         ).to(device)
         logger.info(f"Using Adaptive t-vMF Dice Loss with kappa values: {kappa_values}")
     else:
-        # Use weighted CrossEntropyLoss with DynamicWeightedLoss wrapper for adaptivity
+        # Use weighted CrossEntropyLoss with DynamicLossWeighter wrapper for adaptivity
         base_criterion = nn.CrossEntropyLoss(reduction='none')
-        dynamic_weighter = DynamicWeightedLoss(
-            num_classes=N_CLASSES,
+        dynamic_weighter = DynamicLossWeighter(
+            num_losses=N_CLASSES,
             initial_weights=[0.1, 1.0, 1.0, 1.0]
         ).to(device)
-        logger.info("Using CrossEntropyLoss with DynamicWeighted class adaptation")
+        logger.info("Using CrossEntropyLoss with DynamicLossWeighter class adaptation")
     
     optimizer = torch.optim.Adam(net.parameters(), lr=1e-3)
     
@@ -101,6 +101,9 @@ def train(net, trainloader, epochs, device, kappa_values=None):
             
             optimizer.zero_grad()
             outputs = net(images)
+            # Handle tuple output from RobustMedVFL_UNet
+            if isinstance(outputs, tuple):
+                outputs = outputs[0]  # Take only logits
             
             if kappa_values and criterion is not None:
                 # Advanced adaptive loss
@@ -150,6 +153,9 @@ def test(net, testloader, device):
             for images, labels in testloader:
                 images, labels = images.to(device), labels.to(device)
                 outputs = net(images)
+                # Handle tuple output from RobustMedVFL_UNet
+                if isinstance(outputs, tuple):
+                    outputs = outputs[0]  # Take only logits
                 loss = criterion(outputs, labels.long())
                 total_loss += loss.item() * images.size(0)
                 num_samples += images.size(0)
@@ -170,6 +176,9 @@ def test(net, testloader, device):
             for images, labels in testloader:
                 images, labels = images.to(device), labels.to(device)
                 outputs = net(images)
+                # Handle tuple output from RobustMedVFL_UNet
+                if isinstance(outputs, tuple):
+                    outputs = outputs[0]  # Take only logits
                 loss += criterion(outputs, labels.long()).item()
                 predicted = outputs.argmax(dim=1)
                 correct += (predicted == labels).sum().item()
@@ -188,7 +197,7 @@ def get_testloader():
             data_path=DATA_PATH,
             num_clients=1,
             batch_size=8,
-            partition_strategy="iid",
+            partition_strategy="non-iid",
             val_ratio=0.2,
             training_sources=TRAINING_SOURCES,
             partition_by='patient',
