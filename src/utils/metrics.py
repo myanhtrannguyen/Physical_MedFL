@@ -38,7 +38,14 @@ def evaluate_metrics(model, dataloader, device, num_classes=4):
         for imgs,tgts in dataloader:
             imgs,tgts = imgs.to(device),tgts.to(device)
             if imgs.size(0) == 0: continue
-            logits,_ = model(imgs)
+            
+            # Handle model output (could be tuple or tensor)
+            model_output = model(imgs)
+            if isinstance(model_output, tuple):
+                logits = model_output[0]  # Take only logits
+            else:
+                logits = model_output
+                
             preds = torch.argmax(F.softmax(logits,dim=1),dim=1); batches+=1
             for c in range(num_classes):
                 pc_f,tc_f=(preds==c).float().view(-1),(tgts==c).float().view(-1); inter=(pc_f*tc_f).sum()

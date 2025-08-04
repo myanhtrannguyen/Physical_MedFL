@@ -12,6 +12,15 @@ from sklearn.model_selection import train_test_split
 from typing import List, Tuple, Dict, Any, Union, Optional
 from collections import defaultdict
 import logging
+import pytorch_lightning as pl
+
+# Lightning imports
+try:
+    import pytorch_lightning as pl
+    LIGHTNING_AVAILABLE = True
+except ImportError:
+    LIGHTNING_AVAILABLE = False
+    print("PyTorch Lightning not available for DataModule.")
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 IMG_SIZE = 256
@@ -85,21 +94,28 @@ class H5Dataset(Dataset):
     
     def _resize_and_normalize(self, data: np.ndarray, is_mask: bool) -> np.ndarray:
         """Resize và chuẩn hóa dữ liệu"""
+        # Ensure input is numpy array
+        data = np.asarray(data, dtype=np.float32)
+        
         # Resize
         order = 0 if is_mask else 1  # Nearest neighbor for masks, bilinear for images
         resized = resize(
-            data.astype(np.float32), 
+            data, 
             self.target_size, 
             order=order, 
             preserve_range=True, 
             anti_aliasing=not is_mask
         )
         
+        # Ensure resized is numpy array and handle type conversion properly
+        resized = np.asarray(resized)
+        
         if is_mask:
             return resized.astype(np.uint8)
         else:
             # Normalize image - fix type casting
-            normalized = resized.astype(np.float32) / self.max_pixel_value if self.max_pixel_value > 1.0 else resized.astype(np.float32)
+            resized_float = resized.astype(np.float32)
+            normalized = resized_float / self.max_pixel_value if self.max_pixel_value > 1.0 else resized_float
             return normalized
     
     def _estimate_max_pixel_value(self, sample_size: int = 10) -> float:
@@ -507,3 +523,144 @@ def get_federated_dataloaders(
         logging.info("No test directory found")
             
     return trainloaders, valloaders, testloader
+
+
+# Lightning DataModule Integration
+if LIGHTNING_AVAILABLE:
+    class LightningACDCDataModule(pl.LightningDataModule):
+        """PyTorch Lightning DataModule for ACDC dataset with federated learning support."""
+        
+        def __init__(
+            self,
+            data_path: str,
+            num_clients: int = 2,
+            batch_size: int = 8,
+            num_workers: int = 4,
+            client_id: Optional[int] = None,
+            split_method: str = 'pathology_aware',
+            iid_fraction: float = 0.1,
+            val_split: float = 0.2,
+            seed: int = 42
+        ):
+            super().__init__()
+            self.save_hyperparameters()
+            
+            self.data_path = data_path
+            self.num_clients = num_clients
+            self.batch_size = batch_size
+            self.num_workers = num_workers
+            self.client_id = client_id
+            self.split_method = split_method
+            self.iid_fraction = iid_fraction
+            self.val_split = val_split
+            self.seed = seed
+            
+            # Datasets will be initialized in setup()
+            self.train_dataset = None
+            self.val_dataset = None
+            self.test_dataset = None
+            self.num_train_examples = 0
+            
+        def prepare_data(self) -> None:
+            """Download or prepare data. Called only once per node."""
+            # Data should already be preprocessed and available
+            train_dir = os.path.join(self.data_path, 'ACDC_training_volumes')
+            if not os.path.exists(train_dir):
+                raise FileNotFoundError(f"Training data directory not found: {train_dir}")
+        
+        def setup(self, stage: Optional[str] = None) -> None:
+            """Setup datasets for each stage."""
+            
+            if stage == 'fit' or stage is None:
+                # Load training data
+                train_dir = os.path.join(self.data_path, 'ACDC_training_volumes')
+                train_df = scan_data_directory(train_dir)
+                
+                if self.client_id is not None:
+                    # Federated learning setup - get data for specific client
+                    client_partitions = partition_data(
+                        train_df,
+                        num_clients=self.num_clients,
+                        strategy=self.split_method,
+                        alpha=0.5,  # Default alpha for non-IID
+                        partition_by='patient'
+                    )
+                    
+                    # Get indices for this client
+                    client_indices = client_partitions.get(self.client_id, np.array([]))
+                    if len(client_indices) == 0:
+                        raise ValueError(f"No data assigned to client {self.client_id}")
+                    
+                    # Get data for this client
+                    client_data = train_df.iloc[client_indices].reset_index(drop=True)
+                    
+                    # Split into train/val
+                    train_indices, val_indices = train_test_split(
+                        range(len(client_data)),
+                        test_size=self.val_split,
+                        random_state=self.seed,
+                        stratify=client_data['pathology'] if 'pathology' in client_data.columns else None
+                    )
+                    
+                    self.train_dataset = H5Dataset(client_data.iloc[train_indices].reset_index(drop=True))
+                    self.val_dataset = H5Dataset(client_data.iloc[val_indices].reset_index(drop=True))
+                    self.num_train_examples = len(self.train_dataset)
+                    
+                else:
+                    # Centralized training setup
+                    train_indices, val_indices = train_test_split(
+                        range(len(train_df)),
+                        test_size=self.val_split,
+                        random_state=self.seed,
+                        stratify=train_df['pathology'] if 'pathology' in train_df.columns else None
+                    )
+                    
+                    self.train_dataset = H5Dataset(train_df.iloc[train_indices].reset_index(drop=True))
+                    self.val_dataset = H5Dataset(train_df.iloc[val_indices].reset_index(drop=True))
+                    self.num_train_examples = len(self.train_dataset)
+            
+            if stage == 'test' or stage is None:
+                # Load test data
+                test_dir = os.path.join(self.data_path, 'ACDC_testing_volumes')
+                if os.path.exists(test_dir):
+                    test_df = scan_data_directory(test_dir)
+                    self.test_dataset = H5Dataset(test_df)
+        
+        def train_dataloader(self) -> DataLoader:
+            """Return training dataloader."""
+            if self.train_dataset is None:
+                raise ValueError("Training dataset not initialized. Call setup() first.")
+            return DataLoader(
+                self.train_dataset,
+                batch_size=self.batch_size,
+                shuffle=True,
+                num_workers=self.num_workers,
+                pin_memory=torch.cuda.is_available(),
+                persistent_workers=True if self.num_workers > 0 else False
+            )
+        
+        def val_dataloader(self) -> DataLoader:
+            """Return validation dataloader."""
+            if self.val_dataset is None:
+                raise ValueError("Validation dataset not initialized. Call setup() first.")
+            return DataLoader(
+                self.val_dataset,
+                batch_size=self.batch_size,
+                shuffle=False,
+                num_workers=self.num_workers,
+                pin_memory=torch.cuda.is_available(),
+                persistent_workers=True if self.num_workers > 0 else False
+            )
+        
+        def test_dataloader(self) -> Optional[DataLoader]:
+            """Return test dataloader."""
+            if self.test_dataset is not None:
+                return DataLoader(
+                    self.test_dataset,
+                    batch_size=self.batch_size,
+                    shuffle=False,
+                    num_workers=self.num_workers,
+                    pin_memory=torch.cuda.is_available(),
+                    persistent_workers=True if self.num_workers > 0 else False
+                )
+            return None

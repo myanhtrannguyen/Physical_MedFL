@@ -30,7 +30,7 @@ from flwr.client import NumPyClient
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'src')))
 
 from .task import get_model, get_weights, load_data, set_weights, test, train
-from utils.losses import Adaptive_tvmf_dice_loss, DynamicWeightedLoss
+from utils.losses import Adaptive_tvmf_dice_loss, DynamicLossWeighter
 from utils.metrics import evaluate_metrics
 
 # Setup logging
@@ -275,7 +275,7 @@ class FlowerClient(NumPyClient):
         self.training_start_time: Optional[float] = None
 
         logger.info(
-            f"Research-grade client {experiment_config.client_id} initialized "
+            f"Client {experiment_config.client_id} initialized "
             f"with {sum(p.numel() for p in net.parameters())} parameters"
         )
 
@@ -342,10 +342,10 @@ class FlowerClient(NumPyClient):
             ).to(DEVICE)
             use_advanced_loss = True
         else:
-            # Use DynamicWeightedLoss for consistent fallback strategy
+            # Use DynamicLossWeighter for consistent fallback strategy
             base_criterion = nn.CrossEntropyLoss(reduction='none')
-            dynamic_weighter = DynamicWeightedLoss(
-                num_classes=NUM_CLASSES,
+            dynamic_weighter = DynamicLossWeighter(
+                num_losses=NUM_CLASSES,
                 initial_weights=[0.1, 1.0, 1.0, 1.0]  # Medical segmentation weights
             ).to(DEVICE)
             use_advanced_loss = False

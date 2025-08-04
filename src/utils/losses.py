@@ -23,8 +23,11 @@ class Adaptive_tvmf_dice_loss(nn.Module):
     def update_kappa_values(self, new_kappa_values) -> None:
         if isinstance(new_kappa_values, (list, np.ndarray)):
             new_kappa_values = torch.tensor(new_kappa_values, dtype=torch.float32)
-        device = self.kappa_values.device
-        self.kappa_values.data = new_kappa_values.to(device)
+        if not isinstance(new_kappa_values, torch.Tensor):
+            new_kappa_values = torch.tensor(new_kappa_values, dtype=torch.float32)
+        # Ensure tensor is on the same device as existing kappa_values
+        target_device = str(self.kappa_values.device)
+        self.kappa_values.data = new_kappa_values.to(target_device)
         
     def t_vmf_similarity(self, cos_theta, kappa):
         kappa = F.relu(kappa) + self.epsilon
@@ -83,9 +86,11 @@ class Adaptive_tvmf_dice_loss(nn.Module):
 class PhysicsLoss(nn.Module):
     def __init__(self, in_channels_solver):
         super().__init__()
+        from ..models.RobustMedVFL_UNet import MaxwellSolver
         self.ms = MaxwellSolver(in_channels_solver)
     def forward(self, b1, eps, sig):
-        b, e, s = b1.to(DEVICE), eps.to(DEVICE), sig.to(DEVICE)
+        device = b1.device if b1 is not None else eps.device
+        b, e, s = b1.to(device), eps.to(device), sig.to(device)
         return torch.mean(self.ms.compute_helmholtz_residual(b, e, s))
 
 
@@ -117,7 +122,7 @@ class DynamicLossWeighter(nn.Module):
             individual_losses = torch.stack(individual_losses)
         assert individual_losses.dim() == 1 and individual_losses.size(0) == self.num_losses, \
             f"Input individual_losses must be a 1D tensor of size {self.num_losses}"
-        total_loss = 0.0
+        total_loss = torch.tensor(0.0, device=individual_losses.device, dtype=individual_losses.dtype)
         for i in range(self.num_losses):
             precision = torch.exp(-self.log_vars[i])
             weighted_loss_term = precision * individual_losses[i] + self.log_vars[i]
@@ -222,7 +227,7 @@ class CombinedLoss(nn.Module):
         super().__init__()
         
         # --- Initialize Class Weight Updater ---
-        self.class_weighter = ClassWeightUpdater(num_classes=num_classes).to(DEVICE)
+        self.class_weighter = ClassWeightUpdater(num_classes=num_classes)
         
         # --- Initialize loss components ---
         # 1. Cross Entropy Loss (weights will be set dynamically)
@@ -238,7 +243,7 @@ class CombinedLoss(nn.Module):
         self.sl = SmoothnessLoss()
         
         # --- Initialize Loss Function Weighter ---
-        self.loss_weighter = DynamicLossWeighter(num_losses=4, initial_weights=initial_loss_weights).to(DEVICE)
+        self.loss_weighter = DynamicLossWeighter(num_losses=4, initial_weights=initial_loss_weights)
         
         print("Initialized CombinedLoss with dynamic loss-function weights and dynamic class weights.")
 
@@ -291,7 +296,9 @@ class CombinedLoss(nn.Module):
         """Helper to monitor the dynamic class weights for CrossEntropyLoss."""
         with torch.no_grad():
             current_weights = self.ce.weight
-            return {f"class_{i}_weight": w.item() for i, w in enumerate(current_weights)}
+            if current_weights is not None:
+                return {f"class_{i}_weight": w.item() for i, w in enumerate(current_weights)}
+            return {}
         
     def get_kappa_values(self):
         """Get current κ values for monitoring"""

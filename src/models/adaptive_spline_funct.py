@@ -1,4 +1,8 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 import torchvision.transforms.functional as TF
+
 # --- Adaptive Spline Smoothing Implementation (Provided) ---
 def adaptive_spline_smoothing(x, noise_profile, kernel_size=5, sigma=1.0):
     """
@@ -36,7 +40,7 @@ def adaptive_spline_smoothing(x, noise_profile, kernel_size=5, sigma=1.0):
     # Ensure sigma values are positive to avoid issues
     sigma_tuple = tuple(max(0.1, s) for s in sigma_tuple) # Add small epsilon
 
-    smoothed = TF.gaussian_blur(x_float, kernel_size=kernel_size_tuple, sigma=sigma_tuple)
+    smoothed = TF.gaussian_blur(x_float, kernel_size=list(kernel_size_tuple), sigma=list(sigma_tuple))
 
     # Bước 2: Chuẩn hóa noise_profile (sigmoid) và mở rộng cho đúng số kênh
     # Sigmoid ensures blending weights are between 0 and 1
