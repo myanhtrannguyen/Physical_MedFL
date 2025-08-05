@@ -30,7 +30,7 @@ from flwr.client import NumPyClient
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'src')))
 
 from .task import get_model, get_weights, load_data, set_weights, test, train
-from utils.losses import Adaptive_tvmf_dice_loss, DynamicLossWeighter
+from utils.losses import Adaptive_tvmf_dice_loss, DynamicLossWeighter, CombinedLoss
 from utils.metrics import evaluate_metrics
 
 # Setup logging
@@ -334,21 +334,22 @@ class FlowerClient(NumPyClient):
         base_criterion = None
         dynamic_weighter = None
 
-        # Setup adaptive loss with kappa values from server
+        # Setup loss function - prioritize CombinedLoss for physics-informed training
+        # Use CombinedLoss for physics-informed model
+        criterion = CombinedLoss(num_classes=NUM_CLASSES, in_channels_maxwell=1024).to(DEVICE)
+        use_advanced_loss = True
+        
+        # Fallback to adaptive loss if needed
         if kappa_values:
-            criterion = Adaptive_tvmf_dice_loss(
-                num_classes=NUM_CLASSES,
-                kappa_values=kappa_values
-            ).to(DEVICE)
-            use_advanced_loss = True
-        else:
-            # Use DynamicLossWeighter for consistent fallback strategy
-            base_criterion = nn.CrossEntropyLoss(reduction='none')
-            dynamic_weighter = DynamicLossWeighter(
-                num_losses=NUM_CLASSES,
-                initial_weights=[0.1, 1.0, 1.0, 1.0]  # Medical segmentation weights
-            ).to(DEVICE)
-            use_advanced_loss = False
+            # Store kappa values for potential future use
+            logger.info(f"Received kappa values: {kappa_values}")
+        
+        # Keep dynamic weighter as backup
+        base_criterion = nn.CrossEntropyLoss(reduction='none')
+        dynamic_weighter = DynamicLossWeighter(
+            num_losses=NUM_CLASSES,
+            initial_weights=[0.1, 1.0, 1.0, 1.0]  # Medical segmentation weights
+        ).to(DEVICE)
 
         def calculate_loss(outputs, labels):
             """Calculate loss based on available loss type."""
