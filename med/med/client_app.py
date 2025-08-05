@@ -352,12 +352,28 @@ class FlowerClient(NumPyClient):
 
         def calculate_loss(outputs, labels):
             """Calculate loss based on available loss type."""
+            # Handle tuple outputs from RobustMedVFL_UNet
+            if isinstance(outputs, tuple):
+                logits, maxwell_outputs = outputs
+            else:
+                logits = outputs
+                maxwell_outputs = None
+            
             if use_advanced_loss and criterion is not None:
-                return criterion(outputs, labels)
+                # Use CombinedLoss with physics components
+                if maxwell_outputs is not None:
+                    # Use physics loss with Maxwell outputs
+                    b1 = logits  # Use logits as B1 field approximation
+                    all_es = maxwell_outputs  # Maxwell solver outputs
+                    feat_sm = logits  # Use logits for smoothness regularization
+                    return criterion(logits, labels, b1=b1, all_es=all_es, feat_sm=feat_sm)
+                else:
+                    # Use loss without physics components
+                    return criterion(logits, labels)
             else:
                 # Dynamic weighted loss calculation
                 assert base_criterion is not None and dynamic_weighter is not None
-                base_losses = base_criterion(outputs, labels)
+                base_losses = base_criterion(logits, labels)
                 class_losses = []
                 for c in range(NUM_CLASSES):
                     class_mask = (labels == c)
