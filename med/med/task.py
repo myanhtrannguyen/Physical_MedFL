@@ -1,8 +1,8 @@
 """med: A Flower / PyTorch app for medical image segmentation."""
 
-import logging
 import os
 import sys
+import logging
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -13,10 +13,10 @@ from typing import Dict, List, Optional, Tuple
 # Add src to path for imports
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'src')))
 
-from models.unet import UNet
+from models.RobustMedVFL_UNet import RobustMedVFL_UNet
 from data_handling.data_loader import get_federated_dataloaders
 from utils.metrics import evaluate_metrics
-from utils.losses import Adaptive_tvmf_dice_loss, DynamicLossWeighter
+from utils.losses import CombinedLoss 
 
 # Global variables
 N_CLASSES = 4
@@ -28,12 +28,12 @@ PARTITION_STRATEGY = "non-iid"
 TRAINING_SOURCES = ["slices"]
 
 # Setup logging
+logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 def get_model():
-    """Load model architecture."""
-    return UNet(in_ch=1, num_classes=N_CLASSES, base_c=32)
+    return RobustMedVFL_UNet(n_channels=1, n_classes=N_CLASSES)
 
 def get_weights(net) -> List[np.ndarray]:
     """Get model weights as a list of numpy arrays."""
@@ -64,7 +64,7 @@ def load_data(partition_id: int, num_partitions: int):
     logger.info("Dataloaders cached successfully with lazy loading")
     return trainloaders[partition_id], valloaders[partition_id], testloader
 
-def train(net, trainloader, epochs, device, kappa_values=None):
+def train(net, trainloader, epochs, device, learning_rate=1e-3, kappa_values=None):
     """Train the model on the training set with adaptive loss."""
     net.to(device)
     net.train()
@@ -75,22 +75,14 @@ def train(net, trainloader, epochs, device, kappa_values=None):
     dynamic_weighter = None
     
     # Use advanced adaptive loss for medical segmentation
-    if kappa_values:
-        criterion = Adaptive_tvmf_dice_loss(
-            num_classes=N_CLASSES,
-            kappa_values=kappa_values
-        ).to(device)
-        logger.info(f"Using Adaptive t-vMF Dice Loss with kappa values: {kappa_values}")
-    else:
-        # Use weighted CrossEntropyLoss with DynamicLossWeighter wrapper for adaptivity
-        base_criterion = nn.CrossEntropyLoss(reduction='none')
-        dynamic_weighter = DynamicLossWeighter(
-            num_losses=N_CLASSES,
-            initial_weights=[0.1, 1.0, 1.0, 1.0]
-        ).to(device)
-        logger.info("Using CrossEntropyLoss with DynamicLossWeighter class adaptation")
     
-    optimizer = torch.optim.Adam(net.parameters(), lr=1e-3)
+    criterion = CombinedLoss(num_classes=N_CLASSES, in_channels_maxwell=1024).to(device)
+    logger.info(f"Using Combined Loss with kappa values: {kappa_values}")
+    optimizer = torch.optim.Adam(
+        net.parameters(), 
+        lr=learning_rate, 
+        weight_decay=1e-5  # Regularization to prevent local overfitting
+    )
     
     running_loss = 0.0
     num_batches = 0
@@ -101,26 +93,26 @@ def train(net, trainloader, epochs, device, kappa_values=None):
             
             optimizer.zero_grad()
             outputs = net(images)
+            
             # Handle tuple output from RobustMedVFL_UNet
             if isinstance(outputs, tuple):
-                outputs = outputs[0]  # Take only logits
-            
-            if kappa_values and criterion is not None:
-                # Advanced adaptive loss
-                loss = criterion(outputs, labels.long())
+                # RobustMedVFL_UNet returns (logits, maxwell_outputs)
+                logits, maxwell_outputs = outputs
             else:
-                # Weighted CrossEntropy with dynamic adaptation
-                assert base_criterion is not None and dynamic_weighter is not None
-                base_losses = base_criterion(outputs, labels.long())
-                # Convert to per-class loss for dynamic weighting
-                class_losses = []
-                for c in range(N_CLASSES):
-                    class_mask = (labels == c)
-                    if class_mask.sum() > 0:
-                        class_losses.append(base_losses[class_mask].mean())
-                    else:
-                        class_losses.append(torch.tensor(0.0, device=device))
-                loss = dynamic_weighter(class_losses)
+                # Fallback for simple models
+                logits = outputs
+                maxwell_outputs = None
+            
+            # Use CombinedLoss with physics components
+            if maxwell_outputs is not None:
+                # Use physics loss with Maxwell outputs
+                b1 = logits  # Use logits as B1 field approximation
+                all_es = maxwell_outputs  # Maxwell solver outputs from each decoder block
+                feat_sm = logits  # Use logits for smoothness regularization
+                loss = criterion(logits, labels.long(), b1=b1, all_es=all_es, feat_sm=feat_sm)
+            else:
+                # Use loss without physics components  
+                loss = criterion(logits, labels.long())
             
             loss.backward()
             optimizer.step()
@@ -144,10 +136,12 @@ def test(net, testloader, device):
         fg_dice_scores = metrics['dice_scores'][1:] if N_CLASSES > 1 else metrics['dice_scores']
         avg_fg_dice = sum(fg_dice_scores) / len(fg_dice_scores) if fg_dice_scores else 0.0
         
-        # Calculate loss using CrossEntropyLoss for compatibility
+        # Calculate loss and accuracy for server compatibility
         criterion = nn.CrossEntropyLoss()
         total_loss = 0.0
         num_samples = 0
+        correct_pixels = 0
+        total_pixels = 0
         
         with torch.no_grad():
             for images, labels in testloader:
@@ -155,15 +149,23 @@ def test(net, testloader, device):
                 outputs = net(images)
                 # Handle tuple output from RobustMedVFL_UNet
                 if isinstance(outputs, tuple):
-                    outputs = outputs[0]  # Take only logits
-                loss = criterion(outputs, labels.long())
+                    logits = outputs[0]  # Take only logits, ignore Maxwell outputs
+                else:
+                    logits = outputs
+                loss = criterion(logits, labels.long())
                 total_loss += loss.item() * images.size(0)
                 num_samples += images.size(0)
+                
+                # Calculate pixel accuracy
+                predicted = logits.argmax(dim=1)
+                correct_pixels += (predicted == labels).sum().item()
+                total_pixels += labels.numel()
         
         avg_loss = total_loss / num_samples if num_samples > 0 else 0.0
+        accuracy = correct_pixels / total_pixels if total_pixels > 0 else 0.0
         
-        logger.info(f"Test evaluation - Loss: {avg_loss:.4f}, Avg FG Dice: {avg_fg_dice:.4f}")
-        return avg_loss, avg_fg_dice
+        logger.info(f"Test evaluation - Loss: {avg_loss:.4f}, Accuracy: {accuracy:.4f}, Avg FG Dice: {avg_fg_dice:.4f}")
+        return avg_loss, accuracy
     
     except Exception as e:
         logger.error(f"Error in evaluation: {e}")
@@ -178,9 +180,11 @@ def test(net, testloader, device):
                 outputs = net(images)
                 # Handle tuple output from RobustMedVFL_UNet
                 if isinstance(outputs, tuple):
-                    outputs = outputs[0]  # Take only logits
-                loss += criterion(outputs, labels.long()).item()
-                predicted = outputs.argmax(dim=1)
+                    logits = outputs[0]  # Take only logits
+                else:
+                    logits = outputs
+                loss += criterion(logits, labels.long()).item()
+                predicted = logits.argmax(dim=1)
                 correct += (predicted == labels).sum().item()
                 total_pixels += labels.numel()
         

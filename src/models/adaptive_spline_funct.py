@@ -17,7 +17,6 @@ def adaptive_spline_smoothing(x, noise_profile, kernel_size=5, sigma=1.0):
     # Ensure noise_profile is float and 1 channel
     noise_profile_float = noise_profile.float()
     if noise_profile_float.size(1) != 1:
-         print(f"Warning: Noise profile expected 1 channel but got {noise_profile_float.size(1)}. Using first channel.")
          noise_profile_float = noise_profile_float[:, :1, :, :]
 
 

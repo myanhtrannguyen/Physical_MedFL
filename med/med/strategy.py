@@ -5,6 +5,8 @@ import json
 import logging
 import numpy as np
 import pandas as pd
+import sys
+import os
 from collections import defaultdict
 from datetime import datetime
 from flwr.common import (
@@ -18,6 +20,10 @@ from flwr.common import (
     parameters_to_ndarrays,
 )
 from pathlib import Path
+
+# Add src to path for utils import
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'src')))
+from utils.metrics import evaluate_metrics
 from typing import Dict, List, Optional, Tuple, Union, Any, Callable
 from flwr.server.client_proxy import ClientProxy
 from flwr.server.strategy import FedAvg
@@ -244,7 +250,7 @@ class ExperimentTracker:
         
         return exported_files
 
-class UnifiedFairnessStrategy(FedAvg):
+class AdaFedAdamStrategy(FedAvg):
     """
     Chiến lược hợp nhất kết hợp FAUP, AdaFedAdam, và điều phối Adaptive Loss.
     """
@@ -288,16 +294,16 @@ class UnifiedFairnessStrategy(FedAvg):
     def __init__(
         self,
         *,
-        eta: float = 1e-4,
+        eta: float = 1e-3,
         eta_adapt_rate: float = 1.0,
         beta_1: float = 0.9,
         beta_2: float = 0.99,
         tau: float = 1e-9,
-        w_impact: float = 0.5,
-        w_debt: float = 0.5,
+        w_impact: float = 0.4,
+        w_debt: float = 0.6,
         num_classes: int = 4,
         lambda_val: float = 15.0,
-        experiment_name: str = "UnifiedFairness_Experiment",
+        experiment_name: str = "AdaFedAdam_Experiment",
         evaluate_metrics_aggregation_fn: Optional[Callable[[List[Tuple[int, Dict[str, Scalar]]]], Dict[str, Scalar]]] = None,
         **kwargs,
     ):
@@ -322,7 +328,7 @@ class UnifiedFairnessStrategy(FedAvg):
         self.num_classes = num_classes
         self.lambda_val = lambda_val
         self.kappa_values = np.ones(num_classes) * lambda_val
-        self.experiment_tracker = ExperimentTracker(experiment_name, "UnifiedFairnessStrategy")
+        self.experiment_tracker = ExperimentTracker(experiment_name, "AdaFedAdamStrategy")
         self.current_parameters = self.initial_parameters
         logging.info("Unified Fairness Strategy initialized with enhanced metrics aggregation")
 
