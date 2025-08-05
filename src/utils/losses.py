@@ -86,7 +86,13 @@ class Adaptive_tvmf_dice_loss(nn.Module):
 class PhysicsLoss(nn.Module):
     def __init__(self, in_channels_solver):
         super().__init__()
-        from ..models.RobustMedVFL_UNet import MaxwellSolver
+        try:
+            from models.RobustMedVFL_UNet import MaxwellSolver
+        except ImportError:
+            import sys
+            import os
+            sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+            from models.RobustMedVFL_UNet import MaxwellSolver
         self.ms = MaxwellSolver(in_channels_solver)
     def forward(self, b1, eps, sig):
         device = b1.device if b1 is not None else eps.device
@@ -266,10 +272,10 @@ class CombinedLoss(nn.Module):
         lphy = torch.tensor(0.0, device=logits.device)
         if self.pl is not None and b1 is not None and all_es:
             try:
-                e1, s1 = all_es[0]   #, all_es[1]
+                e1, s1 = all_es[0]
                 lphy = self.pl(b1, e1, s1)
             except (IndexError, TypeError):
-                 print("Warning: Physics loss skipped due to unexpected `all_es` format.")
+                pass
         
         # 4. Smoothness Loss
         lsm = torch.tensor(0.0, device=logits.device)

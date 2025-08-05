@@ -11,15 +11,16 @@ from flwr.server import ServerApp, ServerAppComponents, ServerConfig
 # Add src to path for imports
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'src')))
 
-from .strategy import UnifiedFairnessStrategy
+from .strategy import AdaFedAdamStrategy
 from .task import get_model, get_weights, get_testloader, test, set_weights
 from .utils import export_and_plot_results, create_experiment_summary
+from utils.metrics import evaluate_metrics
 from collections import OrderedDict
 import flwr as fl
 
 
-class MedicalFLStrategy(UnifiedFairnessStrategy):
-    """Extended UnifiedFairnessStrategy with post-processing capabilities."""
+class MedicalFLStrategy(AdaFedAdamStrategy):
+    """Extended AdaFedAdamStrategy with post-processing capabilities."""
     
     def __init__(self, experiment_name: str, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -72,7 +73,7 @@ class MedicalFLStrategy(UnifiedFairnessStrategy):
             # Create enhanced experiment summary
             config = {
                 "rounds_completed": self.rounds_completed,
-                "strategy": "UnifiedFairnessStrategy", 
+                "strategy": "AdaFedAdamStrategy", 
                 "experiment_name": self.experiment_name,
                 "enhanced_tracking": True,
                 "files_exported": list(exported_files.keys()),
@@ -106,12 +107,31 @@ def get_evaluate_fn():
         state_dict = OrderedDict({k: torch.tensor(v) for k, v in params_dict})
         net.load_state_dict(state_dict, strict=True)
         
-        # Evaluate model
+        # Evaluate model with comprehensive metrics
         loss, accuracy = test(net, testloader, device)
         
-        print(f"Server-side evaluation (Round {server_round}): Loss={loss:.4f}, Accuracy={accuracy:.4f}")
+        # Get comprehensive metrics from utils
+        metrics = evaluate_metrics(net, testloader, device, 4)  # N_CLASSES = 4
+        fg_dice = sum(metrics['dice_scores'][1:]) / len(metrics['dice_scores'][1:]) if len(metrics['dice_scores']) > 1 else metrics['dice_scores'][0]
+        fg_iou = sum(metrics['iou'][1:]) / len(metrics['iou'][1:]) if len(metrics['iou']) > 1 else metrics['iou'][0]
+        fg_precision = sum(metrics['precision'][1:]) / len(metrics['precision'][1:]) if len(metrics['precision']) > 1 else metrics['precision'][0]
+        fg_recall = sum(metrics['recall'][1:]) / len(metrics['recall'][1:]) if len(metrics['recall']) > 1 else metrics['recall'][0]
+        fg_f1 = sum(metrics['f1_score'][1:]) / len(metrics['f1_score'][1:]) if len(metrics['f1_score']) > 1 else metrics['f1_score'][0]
         
-        return loss, {"accuracy": accuracy}
+        print(f"Server-side evaluation (Round {server_round}):")
+        print(f"  Loss: {loss:.4f}, Accuracy: {accuracy:.4f}")
+        print(f"  Dice: {fg_dice:.4f}, IoU: {fg_iou:.4f}")
+        print(f"  Precision: {fg_precision:.4f}, Recall: {fg_recall:.4f}, F1: {fg_f1:.4f}")
+        
+        return loss, {
+            "accuracy": accuracy,
+            "centralized_accuracy": accuracy,
+            "fg_dice": fg_dice,
+            "fg_iou": fg_iou,
+            "fg_precision": fg_precision,
+            "fg_recall": fg_recall,
+            "fg_f1": fg_f1
+        }
     
     return evaluate
 
@@ -143,7 +163,7 @@ def server_fn(context: Context):
         initial_parameters=parameters,
         evaluate_fn=get_evaluate_fn(),
         
-        # UnifiedFairnessStrategy specific parameters
+        # AdaFedAdamStrategy specific parameters
         eta=0.0001,
         eta_adapt_rate=1.5,
         w_impact=0.4,

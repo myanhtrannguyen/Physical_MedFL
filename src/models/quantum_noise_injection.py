@@ -17,7 +17,6 @@ def quantum_noise_injection(features, T=1.25, pauli_prob={'X': 0.00096, 'Y': 0.0
     
     # Kiểm tra kích thước tensor
     if features_float.dim() < 4 or features_float.size(2) < 2 or features_float.size(3) < 2:
-        print("Warning: Features too small for quantum noise injection.")
         return features_float
 
     try:

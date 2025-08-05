@@ -371,6 +371,7 @@ class FlowerClient(NumPyClient):
             self.net.parameters(),
             lr=self.experiment_config.learning_rate
         )
+        
 
         # Training metrics
         training_metrics = {
@@ -681,13 +682,14 @@ def client_fn(context: Context):
     
     # Get training config
     local_epochs = int(context.run_config["local-epochs"])
+    learning_rate = float(context.run_config.get("learning-rate", 1e-3))
     experiment_name = str(context.run_config.get("experiment-name", "ACDC_Medical_FL"))
     
     # Create experiment config
     config = ExperimentConfig(
         experiment_name=experiment_name,
         client_id=str(partition_id),
-        learning_rate=1e-3,
+        learning_rate=learning_rate,
         local_epochs=local_epochs,
         batch_size=8,
         data_heterogeneity="iid"
