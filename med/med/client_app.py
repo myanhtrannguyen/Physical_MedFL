@@ -329,28 +329,15 @@ class FlowerClient(NumPyClient):
         start_time = time.time()
         initial_params = self.get_parameters({})
 
-        # Initialize loss components
-        criterion = None
-        base_criterion = None
-        dynamic_weighter = None
-
         # Setup loss function - prioritize CombinedLoss for physics-informed training
         # Use CombinedLoss for physics-informed model
-        criterion = CombinedLoss(num_classes=NUM_CLASSES, in_channels_maxwell=1024).to(DEVICE)
-        use_advanced_loss = True
+        criterion = CombinedLoss(num_classes=NUM_CLASSES, 
+                                in_channels_maxwell=1024,
+                                NUM_CLASSES=4,
+                                lambda_val=15.0,
+                                initial_loss_weights=[0.3, 0.5, 0.5, 1.0, 0.5],
+                                class_indices_for_rules=).to(DEVICE)
         
-        # Fallback to adaptive loss if needed
-        if kappa_values:
-            # Store kappa values for potential future use
-            logger.info(f"Received kappa values: {kappa_values}")
-        
-        # Keep dynamic weighter as backup
-        base_criterion = nn.CrossEntropyLoss(reduction='none')
-        dynamic_weighter = DynamicLossWeighter(
-            num_losses=NUM_CLASSES,
-            initial_weights=[0.1, 1.0, 1.0, 1.0]  # Medical segmentation weights
-        ).to(DEVICE)
-
         def calculate_loss(outputs, labels):
             """Calculate loss based on available loss type."""
             # Handle tuple outputs from RobustMedVFL_UNet
