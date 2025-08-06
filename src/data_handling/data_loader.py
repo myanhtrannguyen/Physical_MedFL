@@ -1,4 +1,4 @@
-# Federated-Learning/src/data_handling/data_loader.py
+# Medical data loading for federated learning
 
 import os
 import h5py

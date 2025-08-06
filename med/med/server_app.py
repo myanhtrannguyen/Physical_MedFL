@@ -1,4 +1,4 @@
-"""med: A Flower / PyTorch app for medical image segmentation."""
+"""Flower/PyTorch app for medical image segmentation."""
 
 import sys
 import os
@@ -8,7 +8,7 @@ import torch
 from flwr.common import Context, ndarrays_to_parameters
 from flwr.server import ServerApp, ServerAppComponents, ServerConfig
 
-# Add src to path for imports
+# Add src to path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'src')))
 
 from .strategy import AdaFedAdamStrategy

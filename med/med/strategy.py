@@ -1,4 +1,4 @@
-"""Strategy module for medical federated learning."""
+"""FL strategy for medical image segmentation."""
 
 import flwr as fl
 import json

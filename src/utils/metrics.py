@@ -1,4 +1,4 @@
-# Federated-Learning/src/utils/metrics.py
+# Segmentation metrics for federated learning evaluation
 
 from typing import Dict, List, Union
 import torch
@@ -8,24 +8,7 @@ from torch.utils.data import DataLoader
 
 
 def evaluate_metrics(model, dataloader, device, num_classes=4):
-    """
-    Evaluates model performance and calculates segmentation metrics.
-
-    Args:
-        model (torch.nn.Module): Model to evaluate
-        dataloader (DataLoader): DataLoader for evaluation data
-        device (torch.device): Device to run evaluation on
-        num_classes (int): Number of classes for segmentation
-
-    Returns:
-        dict: Dictionary containing metrics per class:
-            - dice_scores: List of Dice scores for each class
-            - iou: List of IoU scores for each class
-            - precision: List of precision scores for each class
-            - recall: List of recall scores for each class
-            - f1_score: List of F1 scores for each class
-    """
-
+    """Evaluates model performance and calculates segmentation metrics."""
     model.eval()
     tp = [0] * num_classes
     fp = [0] * num_classes
