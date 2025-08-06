@@ -1,4 +1,4 @@
-# --- Model Components (U-Net based) ---
+# Physics-informed U-Net for medical federated learning
 from torch import nn
 import torch
 import torch.nn.functional as F

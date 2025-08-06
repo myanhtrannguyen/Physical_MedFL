@@ -1,4 +1,4 @@
-"""med: A Flower / PyTorch app for medical image segmentation."""
+"""Flower/PyTorch app for medical image segmentation."""
 
 import os
 import sys
@@ -10,7 +10,7 @@ import numpy as np
 from torch.utils.data import DataLoader
 from typing import Dict, List, Optional, Tuple
 
-# Add src to path for imports
+# Add src to path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'src')))
 
 from models.RobustMedVFL_UNet import RobustMedVFL_UNet
@@ -18,7 +18,7 @@ from data_handling.data_loader import get_federated_dataloaders
 from utils.metrics import evaluate_metrics
 from utils.losses import CombinedLoss 
 
-# Global variables
+# Global config
 N_CLASSES = 4
 IMG_SIZE = 256
 ALPHA = 0.5
@@ -26,28 +26,27 @@ NUM_WORKERS = 4
 DATA_PATH = "../data/ACDC_preprocessed"
 PARTITION_STRATEGY = "non-iid" 
 TRAINING_SOURCES = ["slices"]
-
-# Setup logging
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 def get_model():
+    """Get RobustMedVFL_UNet model."""
     return RobustMedVFL_UNet(n_channels=1, n_classes=N_CLASSES)
 
 def get_weights(net) -> List[np.ndarray]:
-    """Get model weights as a list of numpy arrays."""
+    """Get model weights as numpy arrays."""
     return [val.cpu().numpy() for _, val in net.state_dict().items()]
 
 def set_weights(net, parameters: List[np.ndarray]) -> None:
-    """Set model weights from a list of numpy arrays."""
+    """Set model weights from numpy arrays."""
     params_dict = zip(net.state_dict().keys(), parameters)
     state_dict = {k: torch.tensor(v) for k, v in params_dict}
     net.load_state_dict(state_dict, strict=True)
 
 def load_data(partition_id: int, num_partitions: int):
-    """Load partition data for federated learning."""
-    logger.info(f"Loading federated dataloaders for {num_partitions} clients")
+    """Load federated data partitions."""
+    logger.info(f"Loading data for {num_partitions} clients")
     
     trainloaders, valloaders, testloader = get_federated_dataloaders(
         data_path=DATA_PATH,
@@ -65,19 +64,13 @@ def load_data(partition_id: int, num_partitions: int):
     return trainloaders[partition_id], valloaders[partition_id], testloader
 
 def train(net, trainloader, epochs, device, learning_rate=1e-3, kappa_values=None):
-    """Train the model on the training set with adaptive loss."""
+    """Train model with physics-informed loss."""
     net.to(device)
     net.train()
     
-    # Initialize loss components
-    criterion = None
-    base_criterion = None
-    dynamic_weighter = None
-    
-    # Use advanced adaptive loss for medical segmentation
-    
+    # Setup loss and optimizer
     criterion = CombinedLoss(num_classes=N_CLASSES, in_channels_maxwell=1024).to(device)
-    logger.info(f"Using Combined Loss with kappa values: {kappa_values}")
+    logger.info(f"Using CombinedLoss with kappa: {kappa_values}")
     optimizer = torch.optim.Adam(
         net.parameters(), 
         lr=learning_rate, 
