@@ -42,23 +42,23 @@ serverapp = "med.server_app:app"
 clientapp = "med.client_app:app"
 
 [tool.flwr.app.config]
-num-server-rounds = 10
-fraction-fit = 0.8
-local-epochs = 20
+num-server-rounds = 5
+fraction-fit = 1.0
+local-epochs = 5
 learning-rate = 1e-4
 experiment-name = "ACDC_Medical_FL"
 partition-strategy = "non-iid"    
 alpha = 0.5
-min-fit-clients = 4
-min-available-clients = 4
+min-fit-clients = 2
+min-available-clients = 2
 
 [tool.flwr.federations]
 default = "local-simulation"
 
 [tool.flwr.federations.local-simulation]
-options.num-supernodes = 4
-options.backend.client-resources.num-cpus = 3
-options.backend.client-resources.num-gpus = 0.25
-options.backend.config.memory = 16000000000
-options.backend.config.object-store-memory = 8000000000
+options.num-supernodes = 2
+options.backend.client-resources.num-cpus = 1
+options.backend.client-resources.num-gpus = 0
+options.backend.config.memory = 8000000000
+options.backend.config.object-store-memory = 4000000000
 
