@@ -1,8 +1,8 @@
 """med: A Flower / PyTorch app for medical image segmentation."""
 
+import logging
 import os
 import sys
-import logging
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -10,8 +10,11 @@ import numpy as np
 from torch.utils.data import DataLoader
 from typing import Dict, List, Optional, Tuple
 
-# Add src to path for imports
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'src')))
+# Add src to path for imports - use absolute path
+project_root = "/home/aidev/Physical_MedFL"
+src_path = os.path.join(project_root, 'src')
+if src_path not in sys.path:
+    sys.path.insert(0, src_path)
 
 from models.RobustMedVFL_UNet import RobustMedVFL_UNet
 from data_handling.data_loader import get_federated_dataloaders
@@ -24,7 +27,7 @@ IMG_SIZE = 256
 ALPHA = 0.5
 NUM_WORKERS = 4
 DATA_PATH = "../data/ACDC_preprocessed"
-PARTITION_STRATEGY = "non-iid" 
+PARTITION_STRATEGY = "iid" 
 TRAINING_SOURCES = ["slices"]
 
 # Setup logging
@@ -69,16 +72,8 @@ def train(net, trainloader, epochs, device, learning_rate=1e-3, kappa_values=Non
     net.to(device)
     net.train()
     
-    # Initialize loss components
-    criterion = None
-    base_criterion = None
-    dynamic_weighter = None
-    
-    # Use advanced adaptive loss for medical segmentation
-    
     criterion = CombinedLoss(num_classes=N_CLASSES, 
                                 in_channels_maxwell=1024,
-                                NUM_CLASSES=4,
                                 lambda_val=15.0,
                                 initial_loss_weights=[0.3, 0.5, 0.5, 1.0]
                                 ).to(device)
@@ -127,13 +122,23 @@ def train(net, trainloader, epochs, device, learning_rate=1e-3, kappa_values=Non
             num_batches += 1
 
         # Lấy trọng số cân bằng giữa các loss
-        loss_weights = criterion.get_current_loss_weights() 
+        current_loss_weights = criterion.get_current_loss_weights() 
         # Lấy trọng số của các class
-        class_weights = criterion.get_current_class_weights()
+        current_class_weights = criterion.get_current_class_weights()
 
         # In ra để theo dõi
-        print("Current Loss Weights:", loss_weights)
-        print("Current Class Weights:", class_weights)
+        # print("Current Loss Weights:", loss_weights)
+        # print("Current Class Weights:", class_weights)
+        print(f"\n   Epoch {epoch+1} - Learned Loss Weights:")
+        for name, weight in current_loss_weights.items():
+            print(f"     - {name}: {weight:.4f}")
+            
+        print(f"   Epoch {epoch+1} - Dynamic Class Weights (for CE):")
+        class_weights_str = " | ".join([f"Class {i}: {w:.4f}" for i, w in enumerate(current_class_weights.values())])
+        print(f"     - {class_weights_str}")
+            
+        print("-" * 60)
+        
     
     avg_trainloss = running_loss / max(num_batches, 1)
     return avg_trainloss
@@ -216,7 +221,7 @@ def get_testloader():
             data_path=DATA_PATH,
             num_clients=1,
             batch_size=8,
-            partition_strategy="non-iid",
+            partition_strategy="iid",
             val_ratio=0.2,
             training_sources=TRAINING_SOURCES,
             partition_by='patient',
